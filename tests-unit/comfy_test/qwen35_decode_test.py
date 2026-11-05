@@ -457,6 +457,30 @@ def _tiny_model(monkeypatch, layers=4, head_dim=64):
     return model
 
 
+@pytest.mark.parametrize("mtp", [False, True, "tree2s1"])
+def test_quantized_lm_head_respects_full_precision_policy(monkeypatch, mtp):
+    model = _tiny_model(monkeypatch)
+    original_head = model.model.lm_head
+    operations = comfy.ops.mixed_precision_ops(compute_dtype=torch.float32, full_precision_mm=True)
+    head = operations.Linear(64, 97, bias=False)
+    head.weight = torch.nn.Parameter(
+        QuantizedTensor.from_float(original_head.weight, "TensorWiseINT8Layout"), requires_grad=False)
+    head.quant_format = "int8_tensorwise"
+    head.layout_type = "TensorWiseINT8Layout"
+    original_head.weight = torch.nn.Parameter(head.weight.dequantize(), requires_grad=False)
+    embeds = torch.randn(1, 5, 64)
+    expected = model.generate(embeds.clone(), do_sample=False, max_length=12, mtp=mtp)
+
+    def unsupported_int8(*args, **kwargs):
+        pytest.fail("The output head bypassed full-precision matmul policy")
+
+    monkeypatch.setattr(torch, "_int_mm", unsupported_int8)
+    if hasattr(torch, "int8_mm"):
+        monkeypatch.setattr(torch, "int8_mm", unsupported_int8)
+    model.model.lm_head = head
+    assert model.generate(embeds.clone(), do_sample=False, max_length=12, mtp=mtp) == expected
+
+
 @pytest.mark.parametrize("image_prompt", [False, True])
 def test_greedy_mtp_matches_plain_greedy(monkeypatch, image_prompt):
     # chain and tree verify through the kitchen torch paths: GQA prefix + tree merge, deferred DeltaNet

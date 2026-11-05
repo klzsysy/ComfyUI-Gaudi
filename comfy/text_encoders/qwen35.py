@@ -928,6 +928,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
         def verify_logits(x):
+            if hasattr(self.model, "lm_head"):
+                return head(x)
             if not head.comfy_cast_weights:
                 return F.linear(x, head.weight.to(x), None)
             with comfy.ops.CastBiasWeightContext(head, x, offloadable=True) as (w, _bias):
