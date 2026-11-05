@@ -122,6 +122,9 @@ STRIP_ELEMS = 2 ** 24
 
 
 def strip_apply(fn, x, scale=1, halo=1, out=None):
+    if out is not None and x.device.type == "hpu":
+        # Synapse 1.24.2 corrupts in-place residual additions on these VAE views.
+        return out + strip_apply(fn, x, scale=scale, halo=halo)
     # strips of rows bound cudnn's conv workspace, a halo row per 3x3 conv keeps them exact
     n = -(-x.numel() * scale * scale // STRIP_ELEMS)
     if n <= 1 and out is None:
