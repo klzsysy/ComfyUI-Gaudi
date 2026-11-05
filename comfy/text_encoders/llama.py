@@ -1343,6 +1343,9 @@ class BaseGenerate:
         probs, top_indices = self.processed_probs(logits, temperature, top_k, top_p, min_p, repetition_penalty, token_history, presence_penalty=presence_penalty, penalty_mask=penalty_mask)
         next_token = torch.multinomial(probs, num_samples=1, generator=generator)
         if top_indices is not None:
+            if top_indices.device.type == "hpu":
+                # Synapse 1.24.2 / torch 2.13.0a0+git2469d18 gather rejects int64 data.
+                return top_indices.int().gather(1, next_token).long()
             return top_indices.gather(1, next_token)
         return next_token
 
