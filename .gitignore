@@ -27,3 +27,6 @@ uv.lock
 /previews/
 /test-results/
 /.graph_dumps/
+/.run/
+/logs/
+/.gaudi.env
