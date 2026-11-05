@@ -25,3 +25,5 @@ filtered-openapi.yaml
 uv.lock
 .comfy_environment
 /previews/
+/test-results/
+/.graph_dumps/
