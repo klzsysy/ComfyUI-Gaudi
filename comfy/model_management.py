@@ -1238,7 +1238,7 @@ def text_encoder_device():
     if comfy.memory_management.aimdo_enabled:
         return get_torch_device()
     elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM):
-        if should_use_fp16(prioritize_performance=False):
+        if should_use_fp16(prioritize_performance=False) or is_intel_hpu():
             return get_torch_device()
         else:
             return torch.device("cpu")
@@ -1273,6 +1273,9 @@ def text_encoder_dtype(device=None):
         return torch.bfloat16
     elif args.fp32_text_enc:
         return torch.float32
+
+    if is_device_hpu(device):
+        return torch.bfloat16
 
     if is_device_cpu(device):
         return torch.float16

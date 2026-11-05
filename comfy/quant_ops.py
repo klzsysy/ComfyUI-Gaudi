@@ -91,6 +91,16 @@ class _TensorCoreFP8LayoutBase(_CKFp8Layout):
     FP8_DTYPE = None  # Must be overridden in subclass
 
     @classmethod
+    def dequantize(cls, qdata, params):
+        if qdata.device.type == "hpu" and qdata.dtype == torch.float8_e4m3fn:
+            # Gaudi2 / Synapse 1.24.2 casts E4M3FN values above 240 to inf/NaN.
+            # Decode the storage bytes with the full PyTorch E4M3FN range.
+            values = torch.arange(256, dtype=torch.uint8, device="cpu").view(torch.float8_e4m3fn).float().to(qdata.device)
+            decoded = values[qdata.view(torch.uint8).long()].to(params.orig_dtype)
+            return decoded * params.scale.to(params.orig_dtype)
+        return super().dequantize(qdata, params)
+
+    @classmethod
     def quantize(cls, tensor, scale=None, stochastic_rounding=0, inplace_ops=False):
         if cls.FP8_DTYPE is None:
             raise NotImplementedError(f"{cls.__name__} must define FP8_DTYPE")

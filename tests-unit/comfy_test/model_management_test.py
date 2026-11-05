@@ -114,3 +114,15 @@ def test_cpu_selection_overrides_available_hpu(monkeypatch):
     assert model_management.get_torch_device() == torch.device("cpu")
     assert model_management.get_all_torch_devices() == [torch.device("cpu")]
     assert not model_management.should_use_bf16(torch.device("cpu"))
+
+
+def test_hpu_text_encoder_uses_bf16_and_respects_lowvram(monkeypatch):
+    device = torch.device("hpu", 0)
+    monkeypatch.setattr(model_management, "is_intel_hpu", lambda: True)
+    monkeypatch.setattr(model_management, "get_torch_device", lambda: device)
+    monkeypatch.setattr(model_management, "should_use_fp16", lambda **kwargs: False)
+    monkeypatch.setattr(model_management, "vram_state", model_management.VRAMState.NORMAL_VRAM)
+    assert model_management.text_encoder_device() == device
+    assert model_management.text_encoder_dtype(device) == torch.bfloat16
+    monkeypatch.setattr(model_management, "vram_state", model_management.VRAMState.LOW_VRAM)
+    assert model_management.text_encoder_device() == torch.device("cpu")
