@@ -134,6 +134,8 @@ try:
 except:
     mlu_available = False
 
+hpu_available = hasattr(torch, "hpu") and torch.hpu.is_available()
+
 try:
     ixuca_available = hasattr(torch, "corex")
 except:
@@ -168,6 +170,9 @@ def is_ixuca():
         return True
     return False
 
+def is_intel_hpu():
+    return cpu_state == CPUState.GPU and hpu_available
+
 def is_wsl():
     version = platform.uname().release
     if version.endswith("-Microsoft"):
@@ -189,6 +194,8 @@ def get_torch_device():
             return torch.device("npu", torch.npu.current_device())
         elif is_mlu():
             return torch.device("mlu", torch.mlu.current_device())
+        elif is_intel_hpu():
+            return torch.device("hpu", torch.hpu.current_device())
         else:
             return torch.device(torch.cuda.current_device())
 
@@ -211,6 +218,9 @@ def get_all_torch_devices(exclude_current=False):
         elif is_mlu():
             for i in range(torch.mlu.device_count()):
                 devices.append(torch.device("mlu", i))
+        elif is_intel_hpu():
+            for i in range(torch.hpu.device_count()):
+                devices.append(torch.device("hpu", i))
         else:
             # Fallback for unhandled GPU backends: at least
             # report the current device so callers like unload_all_models()
@@ -301,7 +311,11 @@ def get_total_memory(dev=None, torch_total_too=False):
         mem_total = comfy.system_memory.virtual_memory_total()
         mem_total_torch = mem_total
     else:
-        if is_intel_xpu():
+        if getattr(dev, "type", None) == "hpu":
+            stats = torch.hpu.memory_stats(dev)
+            mem_total = stats["Limit"]
+            mem_total_torch = stats["InUse"]
+        elif is_intel_xpu():
             stats = torch.xpu.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             mem_total_xpu = torch.xpu.get_device_properties(dev).total_memory
@@ -467,7 +481,7 @@ try:
         if torch_version_numeric[0] >= 2:
             if ENABLE_PYTORCH_ATTENTION == False and args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
                 ENABLE_PYTORCH_ATTENTION = True
-    if is_intel_xpu() or is_ascend_npu() or is_mlu() or is_ixuca():
+    if is_intel_xpu() or is_ascend_npu() or is_mlu() or is_ixuca() or is_intel_hpu():
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             ENABLE_PYTORCH_ATTENTION = True
 except:
@@ -605,6 +619,8 @@ def get_torch_device_name(device):
             except:
                 allocator_backend = ""
             return "{} {} : {}".format(device, torch.cuda.get_device_name(device), allocator_backend)
+        elif device.type == "hpu":
+            return "{} {}".format(device, torch.hpu.get_device_name(device))
         elif device.type == "xpu":
             return "{} {}".format(device, torch.xpu.get_device_name(device))
         else:
@@ -1306,6 +1322,8 @@ def get_autocast_device(dev):
     return "cuda"
 
 def supports_dtype(device, dtype): #TODO
+    if is_device_hpu(device):
+        return dtype in (torch.float32, torch.bfloat16)
     if dtype == torch.float32:
         return True
     if is_device_cpu(device):
@@ -1317,6 +1335,8 @@ def supports_dtype(device, dtype): #TODO
     return False
 
 def supports_cast(device, dtype): #TODO
+    if is_device_hpu(device):
+        return dtype in (torch.float32, torch.bfloat16)
     if dtype == torch.float32:
         return True
     if dtype == torch.float16:
@@ -1343,6 +1363,8 @@ def pick_weight_dtype(dtype, fallback_dtype, device=None):
     return dtype
 
 def device_supports_non_blocking(device):
+    if is_device_hpu(device):
+        return False
     if args.force_non_blocking:
         return True
     if is_device_mps(device):
@@ -1370,7 +1392,7 @@ else:
     if is_nvidia() or is_amd():
         NUM_STREAMS = 2
 
-if args.disable_async_offload:
+if args.disable_async_offload or is_intel_hpu():
     NUM_STREAMS = 0
 
 if NUM_STREAMS > 0:
@@ -1628,7 +1650,7 @@ def is_integrated_gpu():
     device = get_torch_device()
     return device.type == "cuda" and bool(torch.cuda.get_device_properties(device).is_integrated)
 
-DISABLE_PINNED_MEMORY = args.disable_pinned_memory
+DISABLE_PINNED_MEMORY = args.disable_pinned_memory or is_intel_hpu()
 if not DISABLE_PINNED_MEMORY and is_integrated_gpu():
     # Integrated GPU VRAM is carved out of system RAM, so pinning host memory only takes RAM from the GPU.
     DISABLE_PINNED_MEMORY = True
@@ -1803,6 +1825,8 @@ def xformers_enabled():
         return False
     if is_ixuca():
         return False
+    if is_intel_hpu():
+        return False
     return XFORMERS_IS_AVAILABLE
 
 
@@ -1868,7 +1892,11 @@ def get_free_memory(dev=None, torch_free_too=False):
         mem_free_total = comfy.system_memory.virtual_memory_available()
         mem_free_torch = mem_free_total
     else:
-        if is_intel_xpu():
+        if getattr(dev, "type", None) == "hpu":
+            stats = torch.hpu.memory_stats(dev)
+            mem_free_total = stats["Limit"] - stats["InUse"]
+            mem_free_torch = 0  # HPU exposes no separately reclaimable cache.
+        elif is_intel_xpu():
             stats = torch.xpu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
@@ -1931,17 +1959,25 @@ def is_device_cuda(device):
 def is_device_npu(device):
     return is_device_type(device, 'npu')
 
+def is_device_hpu(device):
+    return is_device_type(device, "hpu")
+
 def set_torch_device(device):
-    """Set the current device for the given torch device. Supports CUDA and XPU."""
+    """Set the current device for the given torch device. Supports CUDA, XPU and HPU."""
     if is_device_cuda(device):
         torch.cuda.set_device(device)
     elif is_device_xpu(device):
         torch.xpu.set_device(device)
+    elif is_device_hpu(device):
+        torch.hpu.set_device(device)
 
 def should_use_fp16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
     if device is not None:
         if is_device_cpu(device):
             return False
+
+    if is_device_hpu(device) or (device is None and is_intel_hpu()):
+        return False
 
     if args.force_fp16:
         return True
@@ -2010,6 +2046,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     if FORCE_FP32:
         return False
 
+    if is_device_hpu(device) or (device is None and is_intel_hpu()):
+        return True
+
     if (device is not None and is_device_mps(device)) or mps_mode():
         if mac_version() < (14,):
             return False
@@ -2053,6 +2092,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     return False
 
 def supports_fp8_compute(device=None):
+    if is_device_hpu(device) or (device is None and is_intel_hpu()):
+        return False
+
     if is_device_cpu(device):
         return False
 
@@ -2109,6 +2151,9 @@ def supports_mxfp8_compute(device=None):
     return True
 
 def supports_fp64(device=None):
+    if is_device_hpu(device) or (device is None and is_intel_hpu()):
+        return False
+
     if (device is not None and is_device_mps(device)) or mps_mode():
         return False
 
@@ -2121,6 +2166,9 @@ def supports_fp64(device=None):
     return True
 
 def supports_int8_compute(device=None):
+    if is_device_hpu(device) or (device is None and is_intel_hpu()):
+        return False
+
     if is_device_cpu(device):
         return False
 
@@ -2166,6 +2214,8 @@ def synchronize():
         torch.xpu.synchronize()
     elif is_ascend_npu():
         torch.npu.synchronize()
+    elif is_intel_hpu():
+        torch.hpu.synchronize()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -2182,6 +2232,8 @@ def soft_empty_cache(force=False):
         torch.npu.empty_cache()
     elif is_mlu():
         torch.mlu.empty_cache()
+    elif is_intel_hpu():
+        torch.hpu.synchronize()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()

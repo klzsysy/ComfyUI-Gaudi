@@ -1,5 +1,7 @@
 from unittest.mock import Mock, call
 
+import torch
+
 import comfy.model_management as model_management
 
 
@@ -79,3 +81,36 @@ def test_npu_synchronize(monkeypatch):
     model_management.synchronize()
 
     npu.synchronize.assert_called_once_with()
+
+
+def test_hpu_memory_does_not_use_cuda(monkeypatch):
+    hpu = Mock()
+    hpu.memory_stats.return_value = {"Limit": 10000, "InUse": 2500}
+    monkeypatch.setattr(torch, "hpu", hpu, raising=False)
+    monkeypatch.setattr(torch.cuda, "memory_stats", Mock(side_effect=AssertionError("CUDA called")))
+    device = torch.device("hpu", 0)
+    assert model_management.get_total_memory(device, True) == (10000, 2500)
+    assert model_management.get_free_memory(device, True) == (7500, 0)
+
+
+def test_hpu_precision_policy(monkeypatch):
+    monkeypatch.setattr(model_management, "FORCE_FP32", False)
+    device = torch.device("hpu", 0)
+    assert model_management.should_use_bf16(device)
+    assert not model_management.should_use_fp16(device)
+    assert not model_management.supports_fp8_compute(device)
+    assert not model_management.supports_int8_compute(device)
+    assert not model_management.supports_fp64(device)
+    assert not model_management.supports_cast(device, torch.float8_e4m3fn)
+    assert not model_management.device_supports_non_blocking(device)
+    monkeypatch.setattr(model_management, "FORCE_FP32", True)
+    assert not model_management.should_use_bf16(device)
+
+
+def test_cpu_selection_overrides_available_hpu(monkeypatch):
+    monkeypatch.setattr(model_management, "hpu_available", True)
+    monkeypatch.setattr(model_management, "cpu_state", model_management.CPUState.CPU)
+    assert not model_management.is_intel_hpu()
+    assert model_management.get_torch_device() == torch.device("cpu")
+    assert model_management.get_all_torch_devices() == [torch.device("cpu")]
+    assert not model_management.should_use_bf16(torch.device("cpu"))
