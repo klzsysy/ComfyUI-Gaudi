@@ -18,7 +18,7 @@ from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
 from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVCache, Int8FixedKVCache, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
-from . import hpu_gated_delta
+from . import hpu_gated_delta, hpu_mlp
 
 
 @dataclass
@@ -558,6 +558,7 @@ class Qwen35TransformerBlock(nn.Module):
         else:
             self.self_attn = GatedAttention(config, device=device, dtype=dtype, ops=ops)
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
+        self.hpu_compile_mlp = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 
@@ -570,7 +571,13 @@ class Qwen35TransformerBlock(nn.Module):
 
         # in-place into the input buffer so CUDA-graph replays land in the static x
         x = torch.add(x, h, out=output)
-        x = torch.add(x, self.mlp(x, norm=self.post_attention_layernorm), out=output)
+        if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_mlp
+                and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                and past_key_value is not None and x.shape[1] <= SPEC_ROWS):
+            mlp_output = hpu_mlp.forward(self.mlp, x, self.post_attention_layernorm)
+        else:
+            mlp_output = self.mlp(x, norm=self.post_attention_layernorm)
+        x = torch.add(x, mlp_output, out=output)
         return x, present_key_value
 
 
