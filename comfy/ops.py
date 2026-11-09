@@ -1085,8 +1085,8 @@ def _linear_residual(out, residual, residual_scale):
 def _fp16_linear_wanted(x):
     """kitchen's fp16-accumulate GEMM replaces a plain linear when the user opted into
         fp16 accumulation and the activation is fp16 on CUDA; weights come through cast_bias_weight."""
-    return (getattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
-            and x.dtype == torch.float16 and x.is_cuda)
+    return (x.is_cuda and x.dtype == torch.float16
+            and getattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False))
 
 
 def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_eps,

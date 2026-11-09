@@ -151,22 +151,37 @@ class Block(nn.Module):
         self.proj["ffn_up_gate"] = operations.Linear(dim, 2 * ffn_dim, bias=False, dtype=dtype, device=device)
         self.proj["ffn_down"] = operations.Linear(ffn_dim, dim, bias=False, dtype=dtype, device=device)
 
-    def forward(self, x, mod, pe, transformer_options={}, ref=None, ref_kv=None, kv_out=None, mask=None):
-        # ref: (first reference token, their t=0 modulation) when the references are in the sequence
-        y = modulate(x, self.norm1, mod, 0, ref)
+    def _forward_attention(self, y, pe, transformer_options, ref_kv=None, kv_out=None, mask=None):
         if self.fused_qkv:
             q, k, v = self.proj["qkv"](y).chunk(3, dim=-1)
         else:
             q, k, v = self.proj["q"](y), self.proj["k"](y), self.proj["v"](y)
         del y
-        out = attention(q, k, v, self.q_norm, self.k_norm, pe, self.num_heads, self.comfy_attention, transformer_options, ref_kv, kv_out, mask)
+        out = _attention(q, k, v, self.q_norm, self.k_norm, pe, self.num_heads, self.comfy_attention, transformer_options, ref_kv, kv_out, mask)
         del q, k, v
-        x = residual(x, self.proj["o"](out), mod, 2, ref)
-        del out
-        y = modulate(x, self.norm2, mod, 3, ref)
+        return self.proj["o"](out)
+
+    def _forward_ffn(self, y):
         y = self.proj["ffn_up_gate"](y)
         # situ on the [hidden | gate] halves; int8 weights fold it into the activation quantization
-        return residual(x, comfy.ops.linear_input_act(self.proj["ffn_down"], y, "situ"), mod, 5, ref)
+        return comfy.ops.linear_input_act(self.proj["ffn_down"], y, "situ")
+
+    def forward(self, x, mod, pe, transformer_options={}, ref=None, ref_kv=None, kv_out=None, mask=None):
+        attention_forward, ffn_forward = Block._forward_attention, Block._forward_ffn
+        if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options:
+            attention_forward, ffn_forward = _compiled_block_ops()
+        # Keep modulation and residual rounding outside the compiled projections.
+        # ref: (first reference token, their t=0 modulation) when references are in the sequence
+        out = attention_forward(self, modulate(x, self.norm1, mod, 0, ref), pe, transformer_options, ref_kv, kv_out, mask)
+        x = residual(x, out, mod, 2, ref)
+        del out
+        return residual(x, ffn_forward(self, modulate(x, self.norm2, mod, 3, ref)), mod, 5, ref)
+
+
+@lru_cache(maxsize=1)
+def _compiled_block_ops():
+    return (torch.compile(Block._forward_attention, backend="hpu_backend", dynamic=None),
+            torch.compile(Block._forward_ffn, backend="hpu_backend", dynamic=None))
 
 
 class MOSSImage(nn.Module):
