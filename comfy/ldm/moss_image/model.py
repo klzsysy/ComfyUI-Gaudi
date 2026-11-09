@@ -168,7 +168,7 @@ class Block(nn.Module):
 
     def forward(self, x, mod, pe, transformer_options={}, ref=None, ref_kv=None, kv_out=None, mask=None):
         attention_forward, ffn_forward = Block._forward_attention, Block._forward_ffn
-        if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options:
+        if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options and not comfy.ops.has_forward_hooks(self):
             attention_forward, ffn_forward = _compiled_block_ops()
         # Keep modulation and residual rounding outside the compiled projections.
         # ref: (first reference token, their t=0 modulation) when references are in the sequence

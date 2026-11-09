@@ -17,6 +17,7 @@
 """
 
 import torch
+from torch.nn.modules import module as module_hooks
 import logging
 import contextlib
 import dataclasses
@@ -38,6 +39,12 @@ def run_every_op():
         return
 
     comfy.model_management.throw_exception_if_processing_interrupted()
+
+def has_forward_hooks(module):
+    # Dynamo can omit hook guards, so hooks added after compilation need eager calls.
+    if module_hooks._global_forward_hooks or module_hooks._global_forward_pre_hooks:
+        return True
+    return any(child._forward_hooks or child._forward_pre_hooks for child in module.modules())
 
 def gqa_repeat_factor(query_heads, key_heads, value_heads):
     if key_heads != value_heads:
