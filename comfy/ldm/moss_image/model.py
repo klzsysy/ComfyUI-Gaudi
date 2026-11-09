@@ -180,8 +180,10 @@ class Block(nn.Module):
 
 @lru_cache(maxsize=1)
 def _compiled_block_ops():
-    return (torch.compile(Block._forward_attention, backend="hpu_backend", dynamic=None),
-            torch.compile(Block._forward_ffn, backend="hpu_backend", dynamic=None))
+    # Keep Dynamo dynamic while specializing each HPU recipe to its actual shape.
+    options = {"force_static_compile": True}
+    return (torch.compile(Block._forward_attention, backend="hpu_backend", dynamic=None, options=options),
+            torch.compile(Block._forward_ffn, backend="hpu_backend", dynamic=None, options=options))
 
 
 class MOSSImage(nn.Module):
