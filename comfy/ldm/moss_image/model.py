@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -60,6 +62,18 @@ def rope_split_half(x, pe):
 
 
 def attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_options, ref_kv=None, kv_out=None, mask=None):
+    function = _attention
+    if q.device.type == "hpu" and q.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options:
+        function = _compiled_attention()
+    return function(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_options, ref_kv, kv_out, mask)
+
+
+@lru_cache(maxsize=1)
+def _compiled_attention():
+    return torch.compile(_attention, backend="hpu_backend", dynamic=None)
+
+
+def _attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_options, ref_kv=None, kv_out=None, mask=None):
     B, N, _ = q.shape
     q = q.view(B, N, heads, -1)
     k = k.view(B, N, heads, -1)
