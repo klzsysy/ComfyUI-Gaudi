@@ -76,6 +76,22 @@ def test_moss_block_many_lengths(hpu_compiler, monkeypatch):
             torch.testing.assert_close(actual.cpu(), expected, rtol=0.015, atol=0.015)
 
 
+def test_moss_block_honors_hooks_added_after_compile(hpu_compiler, monkeypatch):
+    block = make_block()
+    x, mod, pe = inputs(17)
+    with torch.no_grad():
+        block(x.clone(), mod, pe)
+        hook = block.proj['o'].register_forward_hook(lambda module, values, output: output * 0.5)
+        try:
+            monkeypatch.setattr(args, "disable_comfy_compiler", True)
+            expected = block(x.clone(), mod, pe)
+            monkeypatch.setattr(args, "disable_comfy_compiler", False)
+            actual = block(x.clone(), mod, pe)
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+        finally:
+            hook.remove()
+
+
 def test_cpu_moss_block_does_not_compile_hpu(monkeypatch):
     monkeypatch.setattr(moss, "_compiled_block_ops", lambda: pytest.fail("HPU compiler used for CPU"))
     block = make_block(device="cpu", dtype=torch.float32)
