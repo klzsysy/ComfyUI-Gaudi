@@ -18,6 +18,7 @@ from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
 from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVCache, Int8FixedKVCache, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
+from . import hpu_gated_delta
 
 
 @dataclass
@@ -378,15 +379,19 @@ class GatedDeltaNet(nn.Module):
             # decode: conv step into the side buffer, then gates + delta rule + gated norm in one
             # kernel; both first commit the previous step's accepted tokens
             kv = past_key_value
+            conv_step = comfy_kitchen.deltanet_conv_step_deferred
+            delta_step = comfy_kitchen.gated_delta_decode_deferred
+            if x.device.type == "hpu" and not comfy.model_management.args.disable_comfy_compiler:
+                conv_step, delta_step = hpu_gated_delta.compiled_ops()
             with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
-                comfy_kitchen.deltanet_conv_step_deferred(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
+                conv_step(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
             with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
                  comfy.ops.CastBiasWeightContext(self.in_proj_b, x, offloadable=True) as (w_b, _):
                 if isinstance(w_a, QuantizedTensor):
                     w_a = w_a.dequantize()
                 if isinstance(w_b, QuantizedTensor):
                     w_b = w_b.dequantize()
-                core_attn_out = comfy_kitchen.gated_delta_decode_deferred(
+                core_attn_out = delta_step(
                     x, w_a, w_b, kv.dt_bias, kv.g_decay, kv.recurrent_state,
                     self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, kv.norm_weight, self.norm.eps,
                     kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl)
