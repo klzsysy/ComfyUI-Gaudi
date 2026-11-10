@@ -15,7 +15,7 @@ import comfy.ops
 import comfy.ldm.common_dit
 import comfy.clip_model
 
-from . import qwen_vl
+from . import hpu_kv_attention, qwen_vl
 
 # widest speculative verify (draft chain or tree rows) the decode caches serve in one step
 SPEC_ROWS = 8
@@ -59,8 +59,12 @@ class FixedKVState(FixedKV):
         for k, r in enumerate(path[1:], 1):
             if r != k:
                 dst, src = (base + k) % self.key.shape[2], (base + r) % self.key.shape[2]
-                self.key[:, :, dst] = self.key[:, :, src]
-                self.value[:, :, dst] = self.value[:, :, src]
+                key, value = self.key[:, :, src], self.value[:, :, src]
+                if self.key.device.type == "hpu":
+                    # Habana 1.24.2 can elide offset-view copies sharing the same storage.
+                    key, value = key.clone(), value.clone()
+                self.key[:, :, dst] = key
+                self.value[:, :, dst] = value
 
     @staticmethod
     def shared(batch, device):
@@ -92,6 +96,11 @@ class FixedKVCache(FixedKVState):
 
     def attend(self, xq, xk, xv):
         tree = self.tracker["tree"]
+        if xq.device.type == "hpu" and xq.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training:
+            decode, tree_decode = hpu_kv_attention.compiled_ops()
+            if tree is not None:
+                return tree_decode(xq, self.key, self.value, self.seqlen, xk, xv, tree.mask)
+            return decode(xq, self.key, self.value, self.seqlen)
         if tree is not None:
             # every row attends the committed prefix, then its ancestors and itself through the log-sum-exp
             out, lse = comfy_kitchen.flash_attention_decode_gqa(xq, self.key, self.value, self.seqlen, return_lse=True, causal=False)
