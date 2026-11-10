@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
+from functools import lru_cache
 from tqdm import tqdm
 import contextlib
 import os
@@ -484,6 +485,7 @@ class GatedAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.comfy_attention = ComfyAttention()
+        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
 
     def kv_cache_type(self, device, dtype):
         method = self.comfy_attention.method
@@ -499,6 +501,15 @@ class GatedAttention(nn.Module):
         return cache_type.zeros(batch, self.num_kv_heads, capacity, self.head_dim, device, dtype, shared[cache_type])
 
     def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
+        if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode
+                and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                and type(past_key_value) is FixedKVCache and x.shape[1] <= SPEC_ROWS and attention_mask is None
+                and self.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()
+                and not comfy.ops.has_forward_hooks(self)):
+            return _compiled_hpu_attention()(self, x, freqs_cis, past_key_value)
+        return self._forward(x, attention_mask, freqs_cis, optimized_attention, past_key_value)
+
+    def _forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
         batch_size, seq_length, _ = x.shape
 
         # Project Q (with gate), K, V
@@ -546,6 +557,15 @@ class GatedAttention(nn.Module):
 
         output = output * gate.sigmoid()
         return self.o_proj(output), present_key_value
+
+
+def _hpu_attention(module, x, freqs_cis, past_key_value):
+    return module._forward(x, freqs_cis=freqs_cis, past_key_value=past_key_value)
+
+
+@lru_cache(maxsize=1)
+def _compiled_hpu_attention():
+    return torch.compile(_hpu_attention, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
 # Hybrid Transformer Block
