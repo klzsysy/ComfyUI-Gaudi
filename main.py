@@ -685,6 +685,9 @@ if __name__ == "__main__":
             "ComfyUI native formats like fp8, int8 and w4a8 will be faster even if they are larger than your memory."
         )
     event_loop, prompt_server, start_all_func = start_comfyui()
+    if comfy.model_management.is_intel_hpu():
+        # Synapse 1.24.2 replaces Python's SIGPIPE policy and treats closed HTTP sockets as fatal.
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     try:
         x = start_all_func()
         if product_tips.tips_enabled(args, os.environ):
