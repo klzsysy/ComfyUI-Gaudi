@@ -241,6 +241,13 @@ class MOSSImage(nn.Module):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, None)
         return kv
 
+    def preprocess_text(self, context, height, width, transformer_options={}, context_attention_bias=None):
+        pe = self.rope(height, width, context.shape[1], context.device, transformer_options)
+        text_mask = None if context_attention_bias is None else context_attention_bias[:, None, None]
+        txt = self.text_embedder(context, pe[:, height * width:], transformer_options, text_mask)
+        return txt, {"pe": pe, "shape": (height, width), "text_len": context.shape[1],
+                     "rope_options": transformer_options.get("rope_options", {}).copy()}
+
     def forward(self, x, timestep, context, transformer_options={}, **kwargs):
         return comfy.patcher_extension.WrapperExecutor.new_class_executor(
             self._forward,
@@ -248,7 +255,7 @@ class MOSSImage(nn.Module):
             comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options)
         ).execute(x, timestep, context, transformer_options, **kwargs)
 
-    def _forward(self, x, timestep, context, transformer_options={}, ref_latents=[], ref_latents_method=None, ref_kv=None, context_attention_bias=None, **kwargs):
+    def _forward(self, x, timestep, context, transformer_options={}, ref_latents=[], ref_latents_method=None, ref_kv=None, context_attention_bias=None, prepared_context=None, prepared_rope=None, **kwargs):
         B, _, H, W = x.shape
         dtype, device = x.dtype, x.device
         transformer_options = transformer_options.copy()
@@ -262,7 +269,13 @@ class MOSSImage(nn.Module):
         refs = [comfy.utils.repeat_to_batch_size(ref, B) for ref in ref_latents]
         # ai-toolkit puts the references on the image's f, Moss-Image-Edit at the text start; shifting the rest keeps them at f = 0, where their keys were computed
         f_offset = -text_len if (len(refs) > 0 or ref_kv is not None) and ref_latents_method != "index_timestep_zero_text_start" else 0
-        pe = self.rope(H, W, text_len, device, transformer_options, [ref.shape[-2:] for ref in refs], f_offset)
+        use_prepared = (prepared_context is not None and prepared_rope is not None
+                        and not comfy.model_management.in_training and not comfy.ops.has_forward_hooks(self)
+                        and not refs and ref_kv is None and prepared_rope["shape"] == (H, W)
+                        and prepared_rope["text_len"] == text_len and prepared_rope["pe"].device == device
+                        and prepared_rope["rope_options"] == transformer_options.get("rope_options", {})
+                        and not any(transformer_options.get(name) for name in ("patches", "patches_replace", "wrappers", "callbacks", "optimized_attention_override")))
+        pe = prepared_rope["pe"] if use_prepared else self.rope(H, W, text_len, device, transformer_options, [ref.shape[-2:] for ref in refs], f_offset)
 
         vec = self.time_embedding(timestep_embedding(timestep, 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
@@ -279,7 +292,7 @@ class MOSSImage(nn.Module):
             text_mask = context_attention_bias[:, None, None]
             mask = torch.nn.functional.pad(context_attention_bias, (H * W, sum(r.shape[-2] * r.shape[-1] for r in refs) + (0 if ref_kv is None else ref_kv.shape[3])))[:, None, None]
 
-        txt = self.text_embedder(context, pe[:, H * W:H * W + text_len], transformer_options, text_mask)
+        txt = prepared_context if use_prepared else self.text_embedder(context, pe[:, H * W:H * W + text_len], transformer_options, text_mask)
         # allocated outside the memory compiler region, the blocks update it in place
         x = torch.cat([self.video_embedder(x.flatten(2).transpose(1, 2)), txt] + [self.video_embedder(r.flatten(2).transpose(1, 2)) for r in refs], dim=1)
         del txt, refs

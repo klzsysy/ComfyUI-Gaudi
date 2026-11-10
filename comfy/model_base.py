@@ -2913,6 +2913,26 @@ class MOSSImage(BaseModel):
         if context_attention_bias is not None:
             out['context_attention_bias'] = comfy.conds.CONDRegular(context_attention_bias)
         ref_latents = kwargs.get("reference_latents", None)
+        device = kwargs.get("device")
+        latent_shapes = kwargs.get("latent_shapes")
+        single_latent = not latent_shapes or (len(latent_shapes) == 1 and tuple(latent_shapes[0]) == tuple(kwargs["noise"].shape))
+        if (cross_attn is not None and comfy.model_management.is_device_hpu(device)
+                and self.get_dtype_inference() == torch.bfloat16 and torch.is_inference_mode_enabled()
+                and not comfy.model_management.in_training and kwargs.get("hooks") is None
+                and not ref_latents and kwargs.get("area") is None and kwargs.get("control") is None
+                and single_latent and kwargs["noise"].ndim == 4 and not comfy.ops.has_forward_hooks(self.diffusion_model)):
+            model_options = self.current_patcher.model_options if self.current_patcher is not None else {}
+            options = model_options.get("transformer_options", {})
+            if (not (set(model_options) - {"transformer_options"})
+                    and not (set(options) - {"rope_options", "prefetch_dynamic_vbars"})
+                    and (self.current_patcher is None or not self.current_patcher.hook_patches)):
+                height, width = kwargs["noise"].shape[-2:]
+                dtype = self.get_dtype_inference()
+                bias = context_attention_bias.to(device=device, dtype=dtype) if context_attention_bias is not None else None
+                txt, rope = self.diffusion_model.preprocess_text(cross_attn.to(device=device, dtype=dtype), height, width, options, bias)
+                out['prepared_context'] = comfy.conds.CONDRegular(txt)
+                # The payload preserves FP32 RoPE through BaseModel's compute-dtype conversion.
+                out['prepared_rope'] = comfy.conds.CONDConstant(rope)
         if ref_latents:
             # control adapters widen video_embedder, the references carry no control
             channels = self.diffusion_model.video_embedder.weight.shape[1]
