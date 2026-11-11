@@ -5,14 +5,41 @@ import comfy_kitchen
 from comfy.text_encoders import hpu_gated_delta
 
 
-@pytest.mark.parametrize("batch,rows", [(1, 1), (1, 3), (1, 8), (2, 8)])
-def test_compiled_deferred_state_reuse(batch, rows):
+def test_four_row_activation_is_materialized_before_compilation(monkeypatch):
+    calls = []
+
+    def compile(function, **options):
+        def invoke(x, *values, **kwargs):
+            calls.append((x, values, kwargs))
+            return x
+        return invoke
+
+    hpu_gated_delta.compiled_ops.cache_clear()
+    monkeypatch.setattr(torch, "compile", compile)
+    try:
+        _, decode = hpu_gated_delta.compiled_ops()
+        for rows in (1, 4, 8):
+            x = torch.randn(1, rows, 16, requires_grad=True)
+            output = decode(x, "weight", eps=1e-6)
+            received, values, kwargs = calls[-1]
+            assert (received.data_ptr() != x.data_ptr()) == (rows == 4)
+            assert values == ("weight",) and kwargs == {"eps": 1e-6}
+            torch.testing.assert_close(output, x, atol=0, rtol=0)
+            output.sum().backward()
+            torch.testing.assert_close(x.grad, torch.ones_like(x))
+    finally:
+        hpu_gated_delta.compiled_ops.cache_clear()
+
+
+@pytest.mark.parametrize("batch,rows,heads,key_heads", [(1, rows, 32, 16) for rows in range(1, 9)] + [(2, 4, 32, 16), (2, 8, 32, 16), (1, 4, 16, 16)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compiled_deferred_state_reuse(batch, rows, heads, key_heads, dtype):
     if not hasattr(torch, "hpu") or not torch.hpu.is_available():
         pytest.skip("Requires an HPU")
     torch.manual_seed(41)
+    torch._dynamo.reset()
     device = "hpu"
-    dtype = torch.bfloat16
-    heads, key_heads, dim, hidden = 4, 2, 128, 256
+    dim, hidden = 128, 256
     channels = (2 * key_heads + heads) * dim
 
     def rand(*shape, dt=dtype):
@@ -39,7 +66,7 @@ def test_compiled_deferred_state_reuse(batch, rows):
     # drafts, off-chain commits and alternating side buffers without recompiling.
     parents = [-1, 0, 1, 1, 1, 0, 0, -1] if rows == 8 else list(range(-1, rows - 1))
     program = [32, 5, 6, 33, 3, 4, 2, 7] if rows == 8 else [i | 32 for i in range(rows)]
-    paths = [[], [0], [0, 5] if rows == 8 else list(range(rows)), [], [0]]
+    paths = [[], list(range(rows)), [0], [0, 5] if rows == 8 else list(range(rows)), [], [0]]
     for turn, path in enumerate(paths):
         # New weights with the same shapes must not reuse captured parameter values.
         if turn == 2:
@@ -58,6 +85,47 @@ def test_compiled_deferred_state_reuse(batch, rows):
         torch.testing.assert_close(outputs[1].cpu(), outputs[0].cpu(), rtol=2e-2, atol=4e-3)
         torch.testing.assert_close(candidate[0].cpu(), reference[0].cpu(), rtol=0, atol=0)
         torch.testing.assert_close(candidate[1].cpu(), reference[1].cpu(), rtol=5e-3, atol=5e-4)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_parallel_recurrence_matches_sequential_program(rows, dtype):
+    torch.manual_seed(935)
+    for trial in range(8):
+        state = torch.randn(2, 3, 16, 12, dtype=dtype)
+        query = torch.nn.functional.normalize(torch.randn(2, 3, 16, rows, dtype=dtype), dim=2) * 0.25
+        key = torch.nn.functional.normalize(torch.randn(2, 3, 16, rows, dtype=dtype), dim=2)
+        value = torch.randn(2, 3, 12, rows, dtype=dtype)
+        decay = torch.rand(2, rows, 3, dtype=dtype)
+        beta = torch.rand(2, rows, 3, dtype=dtype)
+        if trial % 2 == 0:
+            decay[:, 0] = 0
+            beta[:, -1] = 0
+
+        def step(current, row):
+            decayed = current * decay[:, row, :, None, None]
+            correction = (value[..., row] - torch.einsum("bhk,bhkv->bhv", key[..., row], decayed)) * beta[:, row, :, None]
+            updated = decayed + key[..., row, None] * correction[:, :, None, :]
+            return updated, torch.einsum("bhk,bhkv->bhv", query[..., row], updated)
+
+        expected = state
+        for row in range(rows):
+            expected, _ = step(expected, row)
+        tolerance = 1e-12 if dtype == torch.float64 else 2e-6
+        actual = hpu_gated_delta._commit(state, key, value, decay, beta)
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+        program = torch.randperm(rows) | (torch.randint(0, 2, (rows,)) * 32)
+        expected = torch.empty(2, rows, 3, 12, dtype=dtype)
+        current = state
+        for instruction in program.tolist():
+            row = instruction & 15
+            updated, output = step(current, row)
+            expected[:, row] = output
+            if instruction & 32:
+                current = updated
+        actual = hpu_gated_delta._tree_output(state, query, key, value, decay, beta, program)
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 def test_cpu_decode_does_not_compile_hpu(monkeypatch):
