@@ -100,8 +100,23 @@ def _attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_
     if ref_kv is not None:
         # the references' keys and values, computed once
         k, v = torch.cat((k, ref_kv[:, 0]), dim=1), torch.cat((v, ref_kv[:, 1]), dim=1)
+    if (q.device.type == "hpu" and q.dtype == torch.bfloat16 and B == 1 and N >= 4096
+            and heads == 24 and q.shape[-1] == 3072 and torch.compiler.is_compiling()
+            and not torch.is_grad_enabled() and not comfy.model_management.in_training
+            and mask is None and ref_kv is None and kv_out is None and comfy_attention.method is None
+            and "optimized_attention_override" not in transformer_options):
+        return _attention_heads(q, k, v, heads, comfy_attention, transformer_options)
     q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
     return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=comfy_attention)
+
+
+def _attention_heads(q, k, v, heads, comfy_attention, transformer_options):
+    # Bound each SDPA intermediate to one head on long HPU sequences.
+    outputs = []
+    for query, key, value in zip(q.chunk(heads, dim=-1), k.chunk(heads, dim=-1), v.chunk(heads, dim=-1)):
+        tensors = (AttentionTensorContainer(tensor) for tensor in (query, key, value))
+        outputs.append(optimized_attention(*tensors, 1, transformer_options=transformer_options, preferred_attention=comfy_attention))
+    return torch.cat(outputs, dim=-1)
 
 
 class TextBlock(nn.Module):
