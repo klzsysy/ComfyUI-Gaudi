@@ -379,8 +379,17 @@ class GatedDeltaNet(nn.Module):
             groups=conv_dim, padding=self.conv_kernel_size - 1, device=device, dtype=dtype)
 
         self.norm = RMSNormGated(self.value_head_dim, eps=config.rms_norm_eps, device=device, dtype=dtype)
+        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
 
     def forward(self, x, past_key_value=None, **kwargs):
+        if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode
+                and x.shape[1] == SPEC_ROWS and type(past_key_value) is LinearKV and past_key_value.decode_step(x.shape[1])
+                and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                and not torch.is_grad_enabled() and not comfy.ops.has_forward_hooks(self)):
+            return _compiled_hpu_delta()(self, x, past_key_value=past_key_value, **kwargs)
+        return self._forward(x, past_key_value=past_key_value, **kwargs)
+
+    def _forward(self, x, past_key_value=None, **kwargs):
         batch_size, seq_len, _ = x.shape
 
         # Projections (shared)
@@ -466,6 +475,11 @@ class GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.value_head_dim), z.reshape(-1, self.value_head_dim))
         output = self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
         return output, present_key_value
+
+
+@lru_cache(maxsize=1)
+def _compiled_hpu_delta():
+    return torch.compile(GatedDeltaNet._forward, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
 # GatedAttention - Full Attention with output gating
