@@ -5,6 +5,7 @@ import comfy.ops
 import comfy.model_management
 from comfy.cli_args import args
 from comfy.ldm.moss_image import model as moss
+from comfy.ldm.modules.attention import attention_pytorch
 
 
 @pytest.fixture
@@ -13,6 +14,9 @@ def hpu_compiler(monkeypatch):
         pytest.skip("HPU required")
     monkeypatch.setattr(args, "disable_comfy_compiler", False)
     monkeypatch.setattr(comfy.model_management, "in_training", False)
+    # CPU-only test modules can select the global sub-quadratic backend during
+    # collection. Exercise the PyTorch backend used by the HPU launch path.
+    monkeypatch.setattr(moss, "optimized_attention", attention_pytorch)
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
@@ -75,3 +79,40 @@ def test_moss_attention_preserves_eager_paths(hpu_compiler, monkeypatch, mode):
     assert torch.isfinite(result).all()
     if mode == "override":
         assert calls == [True]
+
+
+def test_head_attention_preserves_order_and_dispatch(monkeypatch):
+    q, k, v = torch.randn(2, 7, 3 * 128).chunk(3, dim=-1)
+    preferred = moss.ComfyAttention()
+    options = {"block_index": 3}
+    calls = []
+
+    def attention(query, key, value, heads, transformer_options, preferred_attention):
+        calls.append((query.take(), key.take(), value.take()))
+        assert heads == 1 and transformer_options is options and preferred_attention is preferred
+        return calls[-1][2]
+
+    monkeypatch.setattr(moss, "optimized_attention", attention)
+    actual = moss._attention_heads(q, k, v, 4, preferred, options)
+    torch.testing.assert_close(actual, v, atol=0, rtol=0)
+    for index, (query, key, value) in enumerate(calls):
+        for actual, original in zip((query, key, value), (q, k, v)):
+            torch.testing.assert_close(actual, original[..., index * 32:(index + 1) * 32], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("length", [4119, 4403])
+def test_compiled_head_attention_matches_together(hpu_compiler, length):
+    torch.manual_seed(62)
+    q, k, v = torch.randn(1, length, 3 * 3072, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
+    preferred = moss.ComfyAttention()
+
+    def together(q, k, v):
+        tensors = (moss.AttentionTensorContainer(tensor) for tensor in (q, k, v))
+        return moss.optimized_attention(*tensors, 24, transformer_options={}, preferred_attention=preferred)
+
+    compiled = torch.compile(moss._attention_heads, backend="hpu_backend", dynamic=False, options={"force_static_compile": True})
+    reference = torch.compile(together, backend="hpu_backend", dynamic=False, options={"force_static_compile": True})
+    with torch.no_grad():
+        expected = reference(q, k, v).cpu()
+        actual = compiled(q, k, v, 24, preferred, {}).cpu()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
