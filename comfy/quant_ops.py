@@ -198,6 +198,29 @@ class TensorCoreFP8E5M2Layout(_TensorCoreFP8LayoutBase):
     FP8_DTYPE = torch.float8_e5m2
 
 
+class HPUFP8E4M3Layout(TensorCoreFP8E4M3Layout):
+    @classmethod
+    def quantize(cls, tensor, scale=None, stochastic_rounding=0, inplace_ops=False):
+        # Gaudi2 E4M3 has a finite range of 240. Keep saved weights portable.
+        if scale is None or isinstance(scale, str):
+            scale = tensor.abs().amax().float().clamp_min(1e-12) / 224.0
+        return super().quantize(tensor, scale, stochastic_rounding, inplace_ops)
+
+    @classmethod
+    def dequantize(cls, qdata, params):
+        return qdata.to(params.orig_dtype) * params.scale.to(params.orig_dtype)
+
+
+def hpu_fp8_linear(input, weight, weight_scale, bias=None, input_scale=None):
+    flat = input.reshape(-1, input.shape[-1])
+    if input_scale is None:
+        input_scale = flat.abs().amax(-1, keepdim=True).float().clamp_min(1e-12) / 240.0
+    quantized = torch.ops.hpu.cast_to_fp8_v2(flat, input_scale.reciprocal(), False, False, torch.float8_e4m3fn)[0]
+    output = torch.ops.hpu.fp8_gemm_v2(quantized, False, weight, True, None, input.dtype,
+                                    input_scale, weight_scale, bias, False)
+    return output.reshape(*input.shape[:-1], weight.shape[0])
+
+
 # Backward compatibility alias - default to E4M3
 TensorCoreFP8Layout = TensorCoreFP8E4M3Layout
 TensorWiseINT8Layout = _CKTensorWiseINT8Layout
@@ -211,6 +234,7 @@ AsymW4A8Int8Layout = _CKAsymW4A8Int8Layout
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
 register_layout_class("TensorCoreFP8E4M3Layout", TensorCoreFP8E4M3Layout)
 register_layout_class("TensorCoreFP8E5M2Layout", TensorCoreFP8E5M2Layout)
+register_layout_class("HPUFP8E4M3Layout", HPUFP8E4M3Layout)
 register_layout_class("TensorCoreNVFP4Layout", TensorCoreNVFP4Layout)
 register_layout_class("TensorWiseINT8Layout", _CKTensorWiseINT8Layout)
 register_layout_class("TensorCoreConvRotW4A4Layout", _CKTensorCoreConvRotW4A4Layout)
