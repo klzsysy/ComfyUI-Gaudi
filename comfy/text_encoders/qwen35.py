@@ -18,8 +18,23 @@ from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention
 from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
-from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVCache, Int8FixedKVCache, Llama2_, MLP, RMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
+from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVCache, Int8FixedKVCache, Llama2_, MLP, RMSNorm as LlamaRMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
 from . import hpu_gated_delta, hpu_mlp
+
+
+@lru_cache(maxsize=1)
+def _compiled_hpu_rms_norm():
+    return torch.compile(LlamaRMSNorm.forward, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+class RMSNorm(LlamaRMSNorm):
+    def forward(self, x):
+        if (x.device.type == "hpu" and x.dtype in (torch.bfloat16, torch.float32)
+                and not comfy.model_management.args.disable_comfy_compiler
+                and not comfy.model_management.in_training and not torch.is_grad_enabled()
+                and not comfy.ops.has_forward_hooks(self)):
+            return _compiled_hpu_rms_norm()(self, x)
+        return super().forward(x)
 
 
 @dataclass
