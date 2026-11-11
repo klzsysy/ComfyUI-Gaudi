@@ -37,6 +37,25 @@ def process(conditions, batch=1):
     return {name: condition.process_cond(batch_size=batch).concat([]) for name, condition in conditions.items()}
 
 
+def test_general_rope_coefficients_keep_pairwise_path(hpu, monkeypatch):
+    module = model()
+    original = module.diffusion_model.rope
+    def general_rope(*values, **kwargs):
+        pe = original(*values, **kwargs)
+        pe[..., 1, 1] += 0.1
+        return pe
+    monkeypatch.setattr(module.diffusion_model, "rope", general_rope)
+    x = torch.randn(1, 128, 4, 5, device="hpu")
+    context = torch.randn(1, 7, 32, device="hpu", dtype=torch.bfloat16)
+    timestep = torch.ones(1, device="hpu")
+    with torch.inference_mode():
+        expected = module.apply_model(x, timestep, c_crossattn=context)
+        prepared = process(module.extra_conds(noise=x, device=x.device, cross_attn=context))
+        assert prepared['prepared_rope']['blockwise'] is False
+        actual = module.apply_model(x, timestep, **prepared)
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("weighted", [False, True])
 def test_preparation_reuses_static_inputs(hpu, monkeypatch, batch, weighted):

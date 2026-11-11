@@ -86,10 +86,11 @@ def _attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_
     else:
         q_scale, _, q_stream = comfy.ops.cast_bias_weight(q_norm, q, offloadable=True)
         k_scale, _, k_stream = comfy.ops.cast_bias_weight(k_norm, k, offloadable=True)
-        operation = comfy.quant_ops.ck.rms_rope_split_half
         if q.device.type == "hpu" and q.dtype == torch.bfloat16 and pe.dtype == torch.float32 and not torch.is_grad_enabled():
-            operation = hpu.rms_rope_split_half
-        q, k = operation(q, k, pe, q_scale, k_scale, q_norm.eps)
+            q, k = hpu.rms_rope_split_half(q, k, pe, q_scale, k_scale, q_norm.eps,
+                                         blockwise=transformer_options.get("_moss_hpu_blockwise_rope", False))
+        else:
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, pe, q_scale, k_scale, q_norm.eps)
         comfy.ops.uncast_bias_weight(q_norm, q_scale, None, q_stream)
         comfy.ops.uncast_bias_weight(k_norm, k_scale, None, k_stream)
     q, k = q.flatten(2), k.flatten(2)
@@ -253,6 +254,7 @@ class MOSSImage(nn.Module):
         text_mask = None if context_attention_bias is None else context_attention_bias[:, None, None]
         txt = self.text_embedder(context, pe[:, height * width:], transformer_options, text_mask)
         return txt, {"pe": pe, "shape": (height, width), "text_len": context.shape[1],
+                     "blockwise": pe.device.type == "hpu" and pe.dtype == torch.float32 and hpu.blockwise_coefficients(pe),
                      "rope_options": transformer_options.get("rope_options", {}).copy()}
 
     def forward(self, x, timestep, context, transformer_options={}, **kwargs):
@@ -276,13 +278,19 @@ class MOSSImage(nn.Module):
         refs = [comfy.utils.repeat_to_batch_size(ref, B) for ref in ref_latents]
         # ai-toolkit puts the references on the image's f, Moss-Image-Edit at the text start; shifting the rest keeps them at f = 0, where their keys were computed
         f_offset = -text_len if (len(refs) > 0 or ref_kv is not None) and ref_latents_method != "index_timestep_zero_text_start" else 0
-        use_prepared = (prepared_context is not None and prepared_rope is not None
-                        and not comfy.model_management.in_training and not comfy.ops.has_forward_hooks(self)
-                        and not refs and ref_kv is None and prepared_rope["shape"] == (H, W)
+        static_inputs = (not comfy.model_management.in_training and not comfy.ops.has_forward_hooks(self)
+                         and not refs and ref_kv is None
+                         and not any(transformer_options.get(name) for name in ("patches", "patches_replace", "wrappers", "callbacks", "optimized_attention_override")))
+        use_prepared = (prepared_context is not None and prepared_rope is not None and static_inputs
+                        and prepared_rope["shape"] == (H, W)
                         and prepared_rope["text_len"] == text_len and prepared_rope["pe"].device == device
-                        and prepared_rope["rope_options"] == transformer_options.get("rope_options", {})
-                        and not any(transformer_options.get(name) for name in ("patches", "patches_replace", "wrappers", "callbacks", "optimized_attention_override")))
+                        and prepared_rope["rope_options"] == transformer_options.get("rope_options", {}))
         pe = prepared_rope["pe"] if use_prepared else self.rope(H, W, text_len, device, transformer_options, [ref.shape[-2:] for ref in refs], f_offset)
+        blockwise_rope = False
+        if device.type == "hpu" and dtype == torch.bfloat16 and pe.dtype == torch.float32 and static_inputs and not torch.is_grad_enabled():
+            blockwise_rope = prepared_rope.get("blockwise", False) if use_prepared else hpu.blockwise_coefficients(pe)
+        if device.type == "hpu":
+            transformer_options["_moss_hpu_blockwise_rope"] = False
 
         vec = self.time_embedding(timestep_embedding(timestep, 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
@@ -303,6 +311,8 @@ class MOSSImage(nn.Module):
         # allocated outside the memory compiler region, the blocks update it in place
         x = torch.cat([self.video_embedder(x.flatten(2).transpose(1, 2)), txt] + [self.video_embedder(r.flatten(2).transpose(1, 2)) for r in refs], dim=1)
         del txt, refs
+        if device.type == "hpu":
+            transformer_options["_moss_hpu_blockwise_rope"] = blockwise_rope
 
         blocks_replace = transformer_options.get("patches_replace", {}).get("dit", {})
         transformer_options["total_blocks"] = len(self.layers)
