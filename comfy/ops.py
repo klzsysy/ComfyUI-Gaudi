@@ -1555,6 +1555,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
         _compute_dtype = compute_dtype
         _full_precision_mm = full_precision_mm
         _disabled = disabled
+        hpu_compile = load_device is not None and load_device.type == "hpu" and quant_config.get("formats") == ["float8_e4m3fn"]
 
         class Linear(torch.nn.Module, MixedPrecisionOp):
             _disabled_formats = disabled
@@ -1638,7 +1639,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 _use_quantized = (
                     getattr(self, 'layout_type', None) is not None and
                     not isinstance(input, QuantizedTensor) and not self._full_precision_mm and
-                    not getattr(self, 'comfy_force_cast_weights', False) and
+                    (not getattr(self, 'comfy_force_cast_weights', False) or self.layout_type == "HPUFP8E4M3Layout") and
                     len(self.weight_function) == 0 and len(self.bias_function) == 0
                 )
                 quantize_input = QUANT_ALGOS.get(getattr(self, 'quant_format', None), {}).get("quantize_input", True)

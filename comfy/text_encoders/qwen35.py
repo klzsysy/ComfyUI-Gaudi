@@ -379,7 +379,7 @@ class GatedDeltaNet(nn.Module):
             groups=conv_dim, padding=self.conv_kernel_size - 1, device=device, dtype=dtype)
 
         self.norm = RMSNormGated(self.value_head_dim, eps=config.rms_norm_eps, device=device, dtype=dtype)
-        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
 
     def forward(self, x, past_key_value=None, **kwargs):
         if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode
@@ -519,7 +519,7 @@ class GatedAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.comfy_attention = ComfyAttention()
-        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
 
     def kv_cache_type(self, device, dtype):
         method = self.comfy_attention.method
@@ -612,7 +612,7 @@ class Qwen35TransformerBlock(nn.Module):
         else:
             self.self_attn = GatedAttention(config, device=device, dtype=dtype, ops=ops)
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
-        self.hpu_compile_mlp = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile_mlp = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 
@@ -1326,6 +1326,13 @@ class Qwen35ClipModel(sd1_clip.SDClipModel):
         class Qwen35_(Qwen35):
             pass
         Qwen35_.model_type = model_type
+
+        quantization = model_options.get("quantization_metadata")
+        load_device = model_options.get("load_device", comfy.model_management.text_encoder_device())
+        if (load_device.type == "hpu" and quantization is not None
+                and quantization.get("formats") == ["float8_e4m3fn"] and model_options.get("custom_operations") is None):
+            model_options = model_options.copy()
+            model_options["custom_operations"] = comfy.ops.mixed_precision_ops(quantization, dtype, load_device=load_device)
 
         super().__init__(device=device, layer=layer, layer_idx=layer_idx, textmodel_json_config={"mtp": True} if mtp else {},
             dtype=dtype, special_tokens={"pad": 248044}, layer_norm_hidden_state=False,

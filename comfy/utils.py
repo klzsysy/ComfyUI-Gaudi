@@ -1465,10 +1465,13 @@ def unpack_latents(combined_latent, latent_shapes):
     return output_tensors
 
 def detect_layer_quantization(state_dict, prefix):
+    formats = set()
     for k in state_dict:
         if k.startswith(prefix) and k.endswith(".comfy_quant"):
-            logging.info("Found quantization metadata version 1")
-            return {"mixed_ops": True}
+            formats.add(json.loads(state_dict[k].numpy().tobytes())["format"])
+    if formats:
+        logging.info("Found quantization metadata version 1")
+        return {"mixed_ops": True, "formats": sorted(formats)}
     return None
 
 def convert_old_quants(state_dict, model_prefix="", metadata={}):
