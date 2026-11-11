@@ -27,7 +27,8 @@ def test_native_modulation_matches_reference(device, batch, length, width):
 
 @pytest.mark.parametrize("batch,length,heads,width", [(1, 23, 4, 32), (2, 31, 4, 128), (1, 307, 24, 128)])
 @pytest.mark.parametrize("general_matrix", [False, True])
-def test_native_rope_layout_and_coefficients(device, batch, length, heads, width, general_matrix):
+@pytest.mark.parametrize("verify_blockwise", [False, True])
+def test_native_rope_layout_and_coefficients(device, batch, length, heads, width, general_matrix, verify_blockwise):
     torch.manual_seed(128)
     packed = torch.randn(batch, length, 3 * heads * width, dtype=torch.bfloat16).to(device)
     q, k, _ = (t.reshape(batch, length, heads, width) for t in packed.chunk(3, dim=-1))
@@ -39,7 +40,9 @@ def test_native_rope_layout_and_coefficients(device, batch, length, heads, width
     if general_matrix:
         pe = pe + torch.randn_like(pe) * 0.1
     pe = pe.to(device)
-    actual = hpu.rms_rope_split_half(q, k, pe, q_scale, k_scale, 1e-6)
+    blockwise = verify_blockwise and hpu.blockwise_coefficients(pe)
+    assert blockwise == (verify_blockwise and not general_matrix)
+    actual = hpu.rms_rope_split_half(q, k, pe, q_scale, k_scale, 1e-6, blockwise=blockwise)
     for value, source, weight in zip(actual, (q, k), (q_scale, k_scale)):
         normalized = torch.nn.functional.rms_norm(source, (width,), weight, 1e-6)
         expected = moss.rope_split_half(normalized, pe)
