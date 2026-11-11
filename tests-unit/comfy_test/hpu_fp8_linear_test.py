@@ -131,3 +131,77 @@ def test_expert_policy():
     experts.load_state_dict(state, strict=False)
     assert experts._full_precision_mm
     assert experts.layout_type == 'TensorCoreFP8E4M3Layout'
+
+
+@pytest.mark.skipif(not hasattr(torch, 'hpu') or not torch.hpu.is_available(), reason='Requires an HPU')
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+def test_forced_compute_cast_keeps_native_fp8(monkeypatch, dtype):
+    layer = load_layer(layer_state()).to('hpu')
+    layer.comfy_force_cast_weights = True
+    called = []
+    native = quant_ops.hpu_fp8_linear
+    def measured(*args, **kwargs):
+        called.append(True)
+        return native(*args, **kwargs)
+    monkeypatch.setattr(quant_ops, 'hpu_fp8_linear', measured)
+    x = torch.randn(2, 64, device='hpu', dtype=dtype)
+    actual = layer(x)
+    assert called == [True]
+    assert actual.dtype == dtype and actual.isfinite().all()
+    layer.weight_function = [lambda weight: weight * 1.01]
+    called.clear()
+    patched = layer(x)
+    assert not called and patched.isfinite().all()
+
+
+def test_quantization_detection_reports_all_formats():
+    from comfy import utils
+    state = {
+        'other.comfy_quant': torch.tensor(list(json.dumps({'format': 'nvfp4'}).encode()), dtype=torch.uint8),
+        'model.a.comfy_quant': torch.tensor(list(json.dumps({'format': 'float8_e4m3fn'}).encode()), dtype=torch.uint8),
+        'model.b.comfy_quant': torch.tensor(list(json.dumps({'format': 'int8_tensorwise'}).encode()), dtype=torch.uint8),
+    }
+    assert utils.detect_layer_quantization(state, 'model.') == {'mixed_ops': True, 'formats': ['float8_e4m3fn', 'int8_tensorwise']}
+    assert utils.detect_layer_quantization(state, 'absent.') is None
+
+
+@pytest.mark.parametrize('device,formats,native', [('hpu', ['float8_e4m3fn'], True), ('cpu', ['float8_e4m3fn'], False),
+                                                   ('hpu', ['int8_tensorwise'], False), ('hpu', ['float8_e4m3fn','int8_tensorwise'], False)])
+def test_qwen_fp8_operation_selection(monkeypatch, device, formats, native):
+    from comfy import sd1_clip
+    from comfy.text_encoders import qwen35
+    captured = {}
+    def initialize(self, *args, **kwargs):
+        captured.update(kwargs)
+    monkeypatch.setattr(sd1_clip.SDClipModel, '__init__', initialize)
+    options = {'load_device': torch.device(device), 'quantization_metadata': {'mixed_ops': True, 'formats': formats}}
+    qwen35.Qwen35ClipModel(dtype=torch.bfloat16, model_options=options)
+    selected = captured['model_options'].get('custom_operations')
+    assert (selected is not None) == native
+    if native:
+        assert selected.hpu_compile
+        assert not selected._full_precision_mm
+    assert 'custom_operations' not in options
+
+
+@pytest.mark.skipif(not hasattr(torch, 'hpu') or not torch.hpu.is_available(), reason='Requires an HPU')
+def test_short_fp8_linear_observes_weights_and_compiler_switch(monkeypatch):
+    from comfy.cli_args import args
+    state = layer_state()
+    state.pop('bias')
+    factory = ops.mixed_precision_ops(compute_dtype=torch.bfloat16, load_device=torch.device('hpu'))
+    layer = factory.Linear(64, 32, bias=False, device='cpu')
+    layer.load_state_dict(state, strict=False)
+    layer.to('hpu')
+    x = torch.randn(1, 4, 64, device='hpu', dtype=torch.bfloat16)
+    monkeypatch.setattr(args, 'disable_comfy_compiler', True)
+    reference = layer(x)
+    monkeypatch.setattr(args, 'disable_comfy_compiler', False)
+    actual = layer(x)
+    torch.testing.assert_close(actual.cpu(), reference.cpu(), rtol=.01, atol=.01)
+    updated = layer.weight.dequantize() * .5
+    layer.set_weight(updated, seed=123)
+    actual = layer(x)
+    monkeypatch.setattr(args, 'disable_comfy_compiler', True)
+    expected = layer(x)
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=.01, atol=.01)
