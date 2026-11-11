@@ -2461,7 +2461,7 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
     if len(temp_sd) > 0:
         sd = temp_sd
-        if custom_operations is None:
+        if custom_operations is None and (metadata is None or "_quantization_metadata" not in metadata):
             sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
 
     parameters = comfy.utils.calculate_parameters(sd)

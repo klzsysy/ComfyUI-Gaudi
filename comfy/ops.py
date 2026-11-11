@@ -1393,6 +1393,15 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
         # Per-format scales; fp8 dtype views handle both legacy uint8-on-disk and native fp8.
         if module.quant_format in ("float8_e4m3fn", "float8_e5m2"):
             scales = {"scale": pop_scale("weight_scale")}
+            if module.quant_format == "float8_e4m3fn" and module._hpu_fp8 and not module._full_precision_mm:
+                # Decode checkpoint bytes on CPU before entering Gaudi2's narrower range.
+                weight = weight.view(torch.float8_e4m3fn)
+                decoded = weight.cpu().float()
+                if decoded.abs().max().item() > 240.0:
+                    weight = (decoded * 0.5).to(torch.float8_e4m3fn)
+                    scales["scale"] = scales["scale"].float() * 2.0
+                module.layout_type = "HPUFP8E4M3Layout"
+                layout_cls = get_layout_class(module.layout_type)
         elif module.quant_format == "mxfp8":
             bs = pop_scale("weight_scale", torch.float8_e8m0fnu)
             if bs is None:
@@ -1527,6 +1536,7 @@ def _quantized_weight_state_dict(module, sd, prefix, extra_quant_conf=None, extr
 
 class MixedPrecisionOp(CastWeightBiasOp):
     quant_format = None
+    _hpu_fp8 = False
     # Prefer small-M execution; Kitchen owns the layout and preserves GEMM support.
     # Keep opt-in until extensive testing allows unconditional relayout and a single
     # resident layout/kernel path instead of parallel canonical and packed paths.
@@ -1539,7 +1549,7 @@ class MixedPrecisionOp(CastWeightBiasOp):
                 and self.quant_format not in disabled_formats)
 
 
-def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[]):
+def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[], load_device=None):
     class MixedPrecisionOps(manual_cast):
         _quant_config = quant_config
         _compute_dtype = compute_dtype
@@ -1565,6 +1575,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 self.tensor_class = None
                 self._full_precision_mm = MixedPrecisionOps._full_precision_mm
                 self._full_precision_mm_config = False
+                self._hpu_fp8 = load_device is not None and load_device.type == "hpu"
 
             def reset_parameters(self):
                 return None
@@ -1631,6 +1642,19 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     len(self.weight_function) == 0 and len(self.bias_function) == 0
                 )
                 quantize_input = QUANT_ALGOS.get(getattr(self, 'quant_format', None), {}).get("quantize_input", True)
+
+                if (_use_quantized and self.layout_type == "HPUFP8E4M3Layout"
+                        and input.device.type == "hpu" and input.dtype in (torch.bfloat16, torch.float32)
+                        and not input.requires_grad and not comfy.model_management.in_training):
+                    with CastBiasWeightContext(self, input, dtype=self.weight.dtype, bias_dtype=input.dtype,
+                                               offloadable=True, compute_dtype=compute_dtype, want_requant=True) as (weight, bias):
+                        scale = getattr(self, 'input_scale', None)
+                        if scale is not None:
+                            scale = comfy.model_management.cast_to_device(scale, input.device, torch.float32) * 2.0
+                        return quant_ops.hpu_fp8_linear(input, weight._qdata, weight._params.scale, bias, scale)
+
+                if getattr(self, 'layout_type', None) == "HPUFP8E4M3Layout":
+                    return self.forward_comfy_cast_weights(input, compute_dtype)
 
                 # Training path: quantized forward with compute_dtype backward via autograd function
                 if (input.requires_grad and _use_quantized and quantize_input):
@@ -1716,7 +1740,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             Without comfy_quant the weight loads as a plain compute_dtype 3D Parameter [E, out, in].
             """
 
-            _disabled_formats = disabled
+            _disabled_formats = set(disabled) | {"float8_e4m3fn"} if load_device is not None and load_device.type == "hpu" else disabled
 
             def __init__(self, num_experts: int, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
                 super().__init__()
@@ -1991,9 +2015,13 @@ def use_quantized_matmul(model, device):
 def pick_operations(weight_dtype, compute_dtype, load_device=None, disable_fast_fp8=False, fp8_optimizations=False, model_config=None):
     if model_config and hasattr(model_config, 'quant_config') and model_config.quant_config:
         logging.info("Using mixed precision operations")
+        if load_device is None:
+            load_device = comfy.model_management.get_torch_device()
         disabled = get_disabled_quant_formats(load_device)
+        if load_device is not None and load_device.type == "hpu":
+            disabled.discard("float8_e4m3fn")
         logging.info("Native ops: {} {}".format(", ".join(QUANT_ALGOS.keys() - disabled), ", emulated ops: {}".format(", ".join(disabled)) if len(disabled) > 0 else ""))
-        return mixed_precision_ops(model_config.quant_config, compute_dtype, disabled=disabled)
+        return mixed_precision_ops(model_config.quant_config, compute_dtype, disabled=disabled, load_device=load_device)
 
     fp8_compute = comfy.model_management.supports_fp8_compute(load_device)
     if (
