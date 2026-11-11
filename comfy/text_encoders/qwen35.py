@@ -430,7 +430,12 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(rep, dim=2)
 
         # Delta rule
-        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+        delta_rule = torch_chunk_gated_delta_rule
+        if (query.device.type == "hpu" and query.dtype in (torch.bfloat16, torch.float32)
+                and not comfy.model_management.args.disable_comfy_compiler
+                and not comfy.model_management.in_training and not torch.is_grad_enabled()):
+            delta_rule = hpu_gated_delta.compiled_prefill(delta_rule)
+        core_attn_out, last_recurrent_state = delta_rule(
             query, key, value, g=g, beta=beta,
             initial_state=None,
             output_final_state=past_key_value is not None,
