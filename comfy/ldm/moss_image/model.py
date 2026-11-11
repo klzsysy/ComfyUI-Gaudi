@@ -12,6 +12,7 @@ import comfy.quant_ops
 import comfy.utils
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+from . import hpu
 
 
 def situ(hidden, gate):
@@ -24,7 +25,10 @@ def modulated_rms_norm(x, norm, scale, shift):
         return norm(x) * (1 + scale) + shift
     # the norm weight is folded into the scale of the fused rmsnorm(x) * (1 + scale) + shift
     weight, _, stream = comfy.ops.cast_bias_weight(norm, x, offloadable=True)
-    out = comfy.quant_ops.ck.rms_adaln(x, weight * (1 + scale) - 1, shift, norm.eps)
+    operation = comfy.quant_ops.ck.rms_adaln
+    if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not torch.is_grad_enabled():
+        operation = hpu.rms_adaln
+    out = operation(x, weight * (1 + scale) - 1, shift, norm.eps)
     comfy.ops.uncast_bias_weight(norm, weight, None, stream)
     return out
 
@@ -82,7 +86,10 @@ def _attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_
     else:
         q_scale, _, q_stream = comfy.ops.cast_bias_weight(q_norm, q, offloadable=True)
         k_scale, _, k_stream = comfy.ops.cast_bias_weight(k_norm, k, offloadable=True)
-        q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, pe, q_scale, k_scale, q_norm.eps)
+        operation = comfy.quant_ops.ck.rms_rope_split_half
+        if q.device.type == "hpu" and q.dtype == torch.bfloat16 and pe.dtype == torch.float32 and not torch.is_grad_enabled():
+            operation = hpu.rms_rope_split_half
+        q, k = operation(q, k, pe, q_scale, k_scale, q_norm.eps)
         comfy.ops.uncast_bias_weight(q_norm, q_scale, None, q_stream)
         comfy.ops.uncast_bias_weight(k_norm, k_scale, None, k_stream)
     q, k = q.flatten(2), k.flatten(2)
