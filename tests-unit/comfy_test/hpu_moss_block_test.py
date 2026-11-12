@@ -34,10 +34,12 @@ def inputs(length, device="hpu", dtype=torch.bfloat16):
 
 
 @pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("fp8_regions", [False, True])
 @pytest.mark.parametrize("mode", ["plain", "mask", "kv", "reference_tokens"])
-def test_compiled_moss_block_contract(hpu_compiler, monkeypatch, fused, mode):
+def test_compiled_moss_block_contract(hpu_compiler, monkeypatch, fused, fp8_regions, mode):
     torch.manual_seed(52)
     block = make_block(fused)
+    block.hpu_fp8 = fp8_regions
     with torch.no_grad():
         for turn, length in enumerate((17, 31, 17)):
             x, mod, pe = inputs(length)
@@ -76,8 +78,10 @@ def test_moss_block_many_lengths(hpu_compiler, monkeypatch):
             torch.testing.assert_close(actual.cpu(), expected, rtol=0.015, atol=0.015)
 
 
-def test_moss_block_honors_hooks_added_after_compile(hpu_compiler, monkeypatch):
+@pytest.mark.parametrize("fp8_regions", [False, True])
+def test_moss_block_honors_hooks_added_after_compile(hpu_compiler, monkeypatch, fp8_regions):
     block = make_block()
+    block.hpu_fp8 = fp8_regions
     x, mod, pe = inputs(17)
     with torch.no_grad():
         block(x.clone(), mod, pe)
@@ -103,9 +107,11 @@ def test_cpu_moss_block_does_not_compile_hpu(monkeypatch):
 @pytest.mark.parametrize("mode", ["disabled", "training", "override"])
 def test_moss_block_eager_paths(hpu_compiler, monkeypatch, mode):
     monkeypatch.setattr(moss, "_compiled_block_ops", lambda: pytest.fail("block compiler should be bypassed"))
+    monkeypatch.setattr(moss, "_compiled_block_forward", lambda: pytest.fail("FP8 block compiler should be bypassed"))
     monkeypatch.setattr(args, "disable_comfy_compiler", mode == "disabled")
     monkeypatch.setattr(comfy.model_management, "in_training", mode == "training")
     block = make_block()
+    block.hpu_fp8 = True
     options, calls = {}, []
     if mode == "override":
         def override(function, *values, **kwargs):

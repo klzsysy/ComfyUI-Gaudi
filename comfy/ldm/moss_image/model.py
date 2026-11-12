@@ -164,6 +164,7 @@ class Block(nn.Module):
         self.comfy_attention = ComfyAttention()
         self.num_heads = num_heads
         self.fused_qkv = fused_qkv
+        self.hpu_fp8 = getattr(operations, "hpu_fp8", False)
         self.norm1 = operations.RMSNorm(dim, eps=1e-6, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(dim, eps=1e-6, dtype=dtype, device=device)
         self.q_norm = operations.RMSNorm(dim // num_heads, eps=1e-6, dtype=dtype, device=device)
@@ -189,9 +190,23 @@ class Block(nn.Module):
         # situ on the [hidden | gate] halves; int8 weights fold it into the activation quantization
         return comfy.ops.linear_input_act(self.proj["ffn_down"], y, "situ")
 
+    def _forward_attention_modulated(self, x, mod, pe, transformer_options):
+        # Keep modulation in its projection region across HPU graph breaks.
+        return self._forward_attention(modulate(x, self.norm1, mod, 0, None), pe, transformer_options)
+
+    def _forward_ffn_modulated(self, x, mod):
+        return self._forward_ffn(modulate(x, self.norm2, mod, 3, None))
+
+    def _forward_fused(self, x, mod, pe, transformer_options):
+        out = self._forward_attention_modulated(x, mod, pe, transformer_options)
+        x = residual(x, out, mod, 2, None)
+        return residual(x, self._forward_ffn_modulated(x, mod), mod, 5, None)
+
     def forward(self, x, mod, pe, transformer_options={}, ref=None, ref_kv=None, kv_out=None, mask=None):
         attention_forward, ffn_forward = Block._forward_attention, Block._forward_ffn
         if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options and not comfy.ops.has_forward_hooks(self):
+            if self.hpu_fp8 and not torch.is_grad_enabled() and ref is None and ref_kv is None and kv_out is None and mask is None:
+                return _compiled_block_forward()(self, x, mod, pe, transformer_options)
             attention_forward, ffn_forward = _compiled_block_ops()
         # Keep modulation and residual rounding outside the compiled projections.
         # ref: (first reference token, their t=0 modulation) when references are in the sequence
@@ -199,6 +214,11 @@ class Block(nn.Module):
         x = residual(x, out, mod, 2, ref)
         del out
         return residual(x, ffn_forward(self, modulate(x, self.norm2, mod, 3, ref)), mod, 5, ref)
+
+
+@lru_cache(maxsize=1)
+def _compiled_block_forward():
+    return torch.compile(Block._forward_fused, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
 @lru_cache(maxsize=1)
