@@ -629,7 +629,7 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
     if SDP_BATCH_LIMIT >= b:
         fp8_attention = ((kwargs.get("transformer_options") or {}).get("fp8_attention", False)
                          and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
-                         and q.shape[:2] == (1, 1) and q.shape[-1] == 128 and 4096 <= q.shape[-2] <= 8192
+                         and q.shape[:2] == (1, 1) and q.shape[-1] == 128 and q.shape[-2] >= 4096
                          and q.shape == k.shape == v.shape and mask is None and not sdpa_extra
                          and get_attn_precision(attn_precision, q.dtype) != torch.float32
                          and torch.compiler.is_compiling() and not args.disable_comfy_compiler
