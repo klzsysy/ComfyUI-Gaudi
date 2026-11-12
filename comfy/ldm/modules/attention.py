@@ -592,17 +592,25 @@ else:
 
 def _hpu_fp8_attention_av(q, k, v):
     # Retain BF16 QK precision. Fuse softmax with FP8 probability output for AV.
+    tiled_query = q.shape[-2] >= 8192
     query, key, value = q[0, 0], k[0, 0], v[0, 0]
     value_scale = value.abs().amax().float().clamp_min(1e-12) / 240.0
     quantized_value = torch.ops.hpu.cast_to_fp8_v2(value, value_scale.reciprocal(), False, False, torch.float8_e4m3fn)[0]
     scale = q.shape[-1] ** -0.25
-    scores = (query * scale) @ (key * scale).transpose(-1, -2)
+    query, key = query * scale, (key * scale).transpose(-1, -2)
+    if tiled_query:
+        # Floor division keeps padding evaluable by the HPU symbolic shape engine.
+        padded_length = ((query.shape[0] + 1535) // 1536) * 1536
+        query = torch.nn.functional.pad(query, (0, 0, 0, padded_length - query.shape[0])).reshape(-1, 1536, q.shape[-1])
+        scores = torch.bmm(query, key.unsqueeze(0).expand(query.shape[0], -1, -1)).flatten(0, 1)
+    else:
+        scores = query @ key
     # A power-of-two scale matches Gaudi2 softmax's FP8 exponent-bias encoding.
     probabilities = torch.ops.hpu.softmax_fp8.Scalar_scales(scores, -1, 1.0, 128.0)
     probability_scale = torch.full((), 1 / 128.0, device=q.device, dtype=torch.float32)
     output = torch.ops.hpu.fp8_gemm_v2(probabilities, False, quantized_value, False, None, q.dtype,
                                     probability_scale, value_scale, None, False)
-    return output.unsqueeze(0).unsqueeze(0)
+    return output[:q.shape[-2]].unsqueeze(0).unsqueeze(0)
 
 
 @wrap_attn

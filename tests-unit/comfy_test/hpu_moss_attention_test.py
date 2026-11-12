@@ -200,6 +200,34 @@ def test_fp8_av_zero_values_and_cpu_dispatch(hpu_compiler, monkeypatch):
     torch.testing.assert_close(attention_pytorch(q, k, v, 1, transformer_options={"fp8_attention": True}), expected)
 
 
+def test_fp8_query_batching_preserves_outputs_across_shapes(hpu_compiler):
+    def original(q, k, v):
+        query, key, value = q[0, 0], k[0, 0], v[0, 0]
+        value_scale = value.abs().amax().float().clamp_min(1e-12) / 240.0
+        quantized_value = torch.ops.hpu.cast_to_fp8_v2(value, value_scale.reciprocal(), False, False, torch.float8_e4m3fn)[0]
+        scale = q.shape[-1] ** -0.25
+        scores = (query * scale) @ (key * scale).transpose(-1, -2)
+        probabilities = torch.ops.hpu.softmax_fp8.Scalar_scales(scores, -1, 1.0, 128.0)
+        probability_scale = torch.full((), 1 / 128.0, device=q.device, dtype=torch.float32)
+        return torch.ops.hpu.fp8_gemm_v2(probabilities, False, quantized_value, False, None, q.dtype,
+                                       probability_scale, value_scale, None, False).unsqueeze(0).unsqueeze(0)
+
+    reference = torch.compile(original, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+    def candidate(q, k, v):
+        assert torch.compiler.is_compiling(), "Changing caption lengths exhausted the compiler cache"
+        return attention_module._hpu_fp8_attention_av(q, k, v)
+
+    compiled = torch.compile(candidate, backend="hpu_backend", dynamic=None,
+                             options={"force_static_compile": True})
+    with torch.no_grad():
+        for length in (8191, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8583, 8629, 9216, 16385, 8192):
+            torch.manual_seed(173)
+            q, k, v = torch.randn(1, 1, length, 3 * 128, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
+            expected = reference(q, k, v).cpu()
+            actual = compiled(q, k, v).cpu()
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("full_precision,disabled,wanted", [(False, [], True), (True, [], False), (False, ["float8_e4m3fn"], False)])
 def test_moss_fp8_attention_capability(full_precision, disabled, wanted):
     operations = comfy.ops.mixed_precision_ops({"formats": ["float8_e4m3fn"]}, full_precision_mm=full_precision,
