@@ -101,7 +101,7 @@ def test_head_attention_preserves_order_and_dispatch(monkeypatch):
             torch.testing.assert_close(actual, original[..., index * 32:(index + 1) * 32], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("length", [4119, 4403])
+@pytest.mark.parametrize("length", [4119, 4403, 8193])
 def test_compiled_head_attention_matches_together(hpu_compiler, length):
     torch.manual_seed(62)
     q, k, v = torch.randn(1, length, 3 * 3072, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
@@ -145,6 +145,24 @@ def test_fp8_av_uses_native_path_through_attention_dispatch(hpu_compiler, monkey
         values = (values / value_scale).to(torch.float8_e4m3fn).float() * value_scale
         reference = probabilities @ values
         assert (actual[0].float().cpu() - reference).norm() / reference.norm() < 0.005
+
+
+@pytest.mark.parametrize("length,relative_tolerance", [(8192, 0.08), (8193, 0.08), (8629, 0.08), (16385, 0.09)])
+def test_fp8_av_keeps_native_path_for_long_sequences(hpu_compiler, monkeypatch, length, relative_tolerance):
+    torch.manual_seed(72)
+    q, k, v = torch.randn(1, length, 3 * 128, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
+
+    def dispatched(q, k, v):
+        return attention_pytorch(q, k, v, 1, transformer_options={"fp8_attention": True})
+
+    with torch.no_grad():
+        expected = attention_pytorch(q, k, v, 1).float()
+        monkeypatch.setattr(comfy.ops, "scaled_dot_product_attention", lambda *a, **kw: pytest.fail("Long sequence bypassed FP8 AV"))
+        actual = torch.compile(dispatched, backend="hpu_backend", dynamic=False)(q, k, v)
+    assert actual.device.type == "hpu" and actual.dtype == torch.bfloat16
+    assert torch.isfinite(actual).all()
+    # Longer diffuse sequences incur more FP8 probability underflow.
+    assert (actual.float() - expected).norm() / expected.norm() < relative_tolerance
 
 
 @pytest.mark.parametrize("mode", ["disabled", "compiler-disabled", "precision", "mask", "scale", "short", "grad"])
