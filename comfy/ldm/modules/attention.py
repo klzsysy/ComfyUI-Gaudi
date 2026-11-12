@@ -590,6 +590,21 @@ else:
     #TODO: other GPUs ?
     SDP_BATCH_LIMIT = 2**31
 
+def _hpu_fp8_attention_av(q, k, v):
+    # Retain BF16 QK precision. Fuse softmax with FP8 probability output for AV.
+    query, key, value = q[0, 0], k[0, 0], v[0, 0]
+    value_scale = value.abs().amax().float().clamp_min(1e-12) / 240.0
+    quantized_value = torch.ops.hpu.cast_to_fp8_v2(value, value_scale.reciprocal(), False, False, torch.float8_e4m3fn)[0]
+    scale = q.shape[-1] ** -0.25
+    scores = (query * scale) @ (key * scale).transpose(-1, -2)
+    # A power-of-two scale matches Gaudi2 softmax's FP8 exponent-bias encoding.
+    probabilities = torch.ops.hpu.softmax_fp8.Scalar_scales(scores, -1, 1.0, 128.0)
+    probability_scale = torch.full((), 1 / 128.0, device=q.device, dtype=torch.float32)
+    output = torch.ops.hpu.fp8_gemm_v2(probabilities, False, quantized_value, False, None, q.dtype,
+                                    probability_scale, value_scale, None, False)
+    return output.unsqueeze(0).unsqueeze(0)
+
+
 @wrap_attn
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     if skip_reshape:
@@ -612,7 +627,17 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
     sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
 
     if SDP_BATCH_LIMIT >= b:
-        out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
+        fp8_attention = ((kwargs.get("transformer_options") or {}).get("fp8_attention", False)
+                         and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
+                         and q.shape[:2] == (1, 1) and q.shape[-1] == 128 and 4096 <= q.shape[-2] <= 8192
+                         and q.shape == k.shape == v.shape and mask is None and not sdpa_extra
+                         and get_attn_precision(attn_precision, q.dtype) != torch.float32
+                         and torch.compiler.is_compiling() and not args.disable_comfy_compiler
+                         and not torch.is_grad_enabled() and not model_management.in_training)
+        if fp8_attention:
+            out = _hpu_fp8_attention_av(q, k, v)
+        else:
+            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
         if not skip_output_reshape:
             out = (
                 out.transpose(1, 2).reshape(b, -1, heads * dim_head)

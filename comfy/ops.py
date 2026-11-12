@@ -1556,6 +1556,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
         _full_precision_mm = full_precision_mm
         _disabled = disabled
         hpu_compile = load_device is not None and load_device.type == "hpu" and quant_config.get("formats") == ["float8_e4m3fn"]
+        hpu_fp8 = hpu_compile and not full_precision_mm and "float8_e4m3fn" not in disabled
 
         class Linear(torch.nn.Module, MixedPrecisionOp):
             _disabled_formats = disabled
