@@ -212,6 +212,7 @@ def _compiled_block_ops():
 class MOSSImage(nn.Module):
     def __init__(self, dim=3072, ffn_dim=8192, num_heads=24, num_layers=42, text_dim=4096, latent_channels=128, fused_qkv=False, image_model=None, dtype=None, device=None, operations=None):
         super().__init__()
+        self.hpu_fp8_attention = getattr(operations, "hpu_fp8", False)
         self.dtype = dtype
         self.latent_channels = latent_channels
         head_dim = dim // num_heads
@@ -283,6 +284,8 @@ class MOSSImage(nn.Module):
         B, _, H, W = x.shape
         dtype, device = x.dtype, x.device
         transformer_options = transformer_options.copy()
+        if self.hpu_fp8_attention:
+            transformer_options.setdefault("fp8_attention", True)
         text_len = context.shape[1]
         if len(ref_latents) > 0 and ref_latents_method not in ("index", "index_timestep_zero"):
             # every step when extra_conds could not precompute them (training, hooks)
