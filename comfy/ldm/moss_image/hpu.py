@@ -26,7 +26,7 @@ def _rope(x, pe, blockwise=False):
 
 
 def rms_rope_split_half(q, k, pe, q_scale, k_scale, eps, blockwise=False):
-    # Retain the existing Q/K normalization and BF16 rounding before FP32 RoPE.
-    q = torch.nn.functional.rms_norm(q, (q.shape[-1],), q_scale, eps)
-    k = torch.nn.functional.rms_norm(k, (k.shape[-1],), k_scale, eps)
+    # Use native FP32 RMSNorm before the existing BF16/RoPE conversion.
+    q = torch.ops.hpu.rms_norm(q.float(), q_scale.float(), eps)[0].to(q.dtype)
+    k = torch.ops.hpu.rms_norm(k.float(), k_scale.float(), eps)[0].to(k.dtype)
     return _rope(q, pe, blockwise), _rope(k, pe, blockwise)

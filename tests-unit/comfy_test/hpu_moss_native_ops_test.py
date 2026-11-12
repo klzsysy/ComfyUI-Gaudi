@@ -28,7 +28,8 @@ def test_native_modulation_matches_reference(device, batch, length, width):
 @pytest.mark.parametrize("batch,length,heads,width", [(1, 23, 4, 32), (2, 31, 4, 128), (1, 307, 24, 128)])
 @pytest.mark.parametrize("general_matrix", [False, True])
 @pytest.mark.parametrize("verify_blockwise", [False, True])
-def test_native_rope_layout_and_coefficients(device, batch, length, heads, width, general_matrix, verify_blockwise):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_native_rope_layout_and_coefficients(device, batch, length, heads, width, general_matrix, verify_blockwise, compiled):
     torch.manual_seed(128)
     packed = torch.randn(batch, length, 3 * heads * width, dtype=torch.bfloat16).to(device)
     q, k, _ = (t.reshape(batch, length, heads, width) for t in packed.chunk(3, dim=-1))
@@ -42,13 +43,19 @@ def test_native_rope_layout_and_coefficients(device, batch, length, heads, width
     pe = pe.to(device)
     blockwise = verify_blockwise and hpu.blockwise_coefficients(pe)
     assert blockwise == (verify_blockwise and not general_matrix)
-    actual = hpu.rms_rope_split_half(q, k, pe, q_scale, k_scale, 1e-6, blockwise=blockwise)
+    function = hpu.rms_rope_split_half
+    if compiled:
+        torch._dynamo.reset()
+        function = torch.compile(function, backend="hpu_backend", dynamic=False)
+    actual = function(q, k, pe, q_scale, k_scale, 1e-6, blockwise=blockwise)
     for value, source, weight in zip(actual, (q, k), (q_scale, k_scale)):
         normalized = torch.nn.functional.rms_norm(source, (width,), weight, 1e-6)
         expected = moss.rope_split_half(normalized, pe)
         torch.testing.assert_close(value.cpu(), expected.cpu(), rtol=0.01, atol=0.02)
         assert value.dtype == source.dtype and value.shape == source.shape
     torch.testing.assert_close(packed.cpu(), saved, rtol=0, atol=0)
+    if compiled:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("mode", ["cpu", "fp32", "grad", "training"])
