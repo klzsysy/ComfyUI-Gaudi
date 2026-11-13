@@ -82,6 +82,17 @@ def _compiled_ffn():
     return torch.compile(SwiGLUFeedForward._forward, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
+def _hpu_rms_rope(q, k, pe, q_scale, k_scale, eps):
+    # Preserve the BF16 projection and RMSNorm boundaries before FP32 rotation.
+    q = F.rms_norm(q, (q.shape[-1],), q_scale, eps)
+    k = F.rms_norm(k, (k.shape[-1],), k_scale, eps)
+    cos = torch.stack((pe[..., 0, 0], pe[..., 1, 1]), dim=-1).flatten(-2)
+    sin = torch.stack((-pe[..., 0, 1], pe[..., 1, 0]), dim=-1).flatten(-2)
+    q = torch.ops.hpu.rotary_pos_embedding(q.to(pe.dtype), sin, cos, None, 0, 1).to(q.dtype)
+    k = torch.ops.hpu.rotary_pos_embedding(k.to(pe.dtype), sin, cos, None, 0, 1).to(k.dtype)
+    return q, k
+
+
 class Attention(nn.Module):
     def __init__(self, dim, heads, dim_head, eps=1e-6, dtype=None, device=None, operations=None):
         super().__init__()
@@ -117,7 +128,11 @@ class Attention(nn.Module):
         else:
             q_scale, _, q_stream = comfy.ops.cast_bias_weight(self.norm_q, q, offloadable=True)
             k_scale, _, k_stream = comfy.ops.cast_bias_weight(self.norm_k, k, offloadable=True)
-            q, k = comfy.quant_ops.ck.rms_rope(q, k, pe, q_scale, k_scale, self.norm_q.eps)
+            rms_rope = comfy.quant_ops.ck.rms_rope
+            if (q.device.type == "hpu" and q.dtype == k.dtype == torch.bfloat16 and pe.dtype == torch.float32
+                    and not comfy.model_management.args.disable_comfy_compiler and not torch.is_grad_enabled()):
+                rms_rope = _hpu_rms_rope
+            q, k = rms_rope(q, k, pe, q_scale, k_scale, self.norm_q.eps)
             comfy.ops.uncast_bias_weight(self.norm_q, q_scale, None, q_stream)
             comfy.ops.uncast_bias_weight(self.norm_k, k_scale, None, k_stream)
         q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
@@ -210,6 +225,25 @@ class QwenImage21FunControl(nn.Module):
         return c, block.after_proj(c)
 
 
+def _attention(q, k, v, heads, mask, transformer_options, preferred_attention):
+    tensors = (AttentionTensorContainer(tensor) for tensor in (q, k, v))
+    return optimized_attention(*tensors, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention)
+
+
+@lru_cache(maxsize=1)
+def _compiled_attention():
+    return torch.compile(_attention, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+def attention(q, k, v, heads, mask=None, transformer_options={}, preferred_attention=None):
+    if (mask is None and q.peek().device.type == "hpu" and q.peek().dtype == torch.bfloat16 and not torch.is_grad_enabled()
+            and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+            and "optimized_attention_override" not in transformer_options
+            and (preferred_attention is None or preferred_attention.method is None)):
+        return _compiled_attention()(q.take(), k.take(), v.take(), heads, mask, transformer_options, preferred_attention)
+    return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention)
+
+
 def block_causal_attention(segments, transformer_options={}, cache=None, block_index=0, prefix_len=0):
     # segments: (start, end, mask); text segments get a causal mask, image blocks attend to everything before their end
     def attn(q, k, v, heads, preferred_attention=None):
@@ -224,7 +258,7 @@ def block_causal_attention(segments, transformer_options={}, cache=None, block_i
             value = AttentionTensorContainer(v[:, :end].flatten(2))
             if i == len(segments) - 1:
                 del q, k, v
-            outs.append(optimized_attention(query, key, value, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention))
+            outs.append(attention(query, key, value, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention))
         return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
     return attn
 
@@ -235,7 +269,7 @@ def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
         q = AttentionTensorContainer(q.take().flatten(2))
         k = AttentionTensorContainer(torch.cat([prefix_k, k.take()], dim=1).flatten(2))
         v = AttentionTensorContainer(torch.cat([prefix_v, v.take()], dim=1).flatten(2))
-        return optimized_attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention)
+        return attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention)
     return attn
 
 

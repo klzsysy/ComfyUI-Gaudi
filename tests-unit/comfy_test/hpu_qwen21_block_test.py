@@ -94,3 +94,65 @@ def test_custom_operations_keep_eager_ffn(compiler, monkeypatch):
     with torch.no_grad():
         output = module(torch.ones(1, 17, 128, device='hpu', dtype=torch.bfloat16))
     assert torch.isfinite(output.cpu()).all()
+
+
+@pytest.mark.parametrize('general', [False, True])
+@pytest.mark.parametrize('batch,length', [(1, 17), (2, 31), (1, 4096)])
+def test_native_rms_rope_preserves_coefficients(compiler, general, batch, length):
+    torch.manual_seed(106)
+    with torch.no_grad():
+        q, k = torch.randn(2, batch, length, 4, 128, dtype=torch.bfloat16).to('hpu').unbind(0)
+        q_scale, k_scale = (torch.randn(128, dtype=torch.bfloat16).to('hpu') * .1 + 1 for _ in range(2))
+        angle = torch.randn(1, length, 1, 64)
+        pe = torch.stack((angle.cos(), -angle.sin(), angle.sin(), angle.cos()), -1).reshape(1, length, 1, 64, 2, 2)
+        if general:
+            pe = torch.randn_like(pe)
+        pe = pe.to('hpu')
+        expected = comfy.ops.quant_ops.ck.rms_rope(q, k, pe, q_scale, k_scale, 1e-6)
+        actual = qwen._hpu_rms_rope(q, k, pe, q_scale, k_scale, 1e-6)
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result.cpu(), reference.cpu(), rtol=0, atol=0)
+
+
+def test_cached_attention_switches_prefix_lengths(compiler, monkeypatch):
+    torch.manual_seed(107)
+    with torch.no_grad():
+        for length, prefix in [(31, 5), (43, 7), (31, 5)]:
+            query, key, value = torch.randn(3, 2, length, 4, 32, dtype=torch.bfloat16).to('hpu').unbind(0)
+            prefix_k, prefix_v = torch.randn(2, 2, prefix, 4, 32, dtype=torch.bfloat16).to('hpu').unbind(0)
+            function = qwen.prefix_cached_attention(prefix_k, prefix_v)
+            def run():
+                containers = (qwen.AttentionTensorContainer(t) for t in (query, key, value))
+                return function(*containers, 4, preferred_attention=qwen.ComfyAttention())
+            monkeypatch.setattr(args, 'disable_comfy_compiler', True)
+            expected = run().cpu()
+            monkeypatch.setattr(args, 'disable_comfy_compiler', False)
+            actual = run().cpu()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_attention_override_bypasses_compilation(compiler, monkeypatch):
+    monkeypatch.setattr(qwen, '_compiled_attention', lambda: pytest.fail('override must bypass compilation'))
+    calls = []
+    def override(function, q, k, v, heads, **kwargs):
+        calls.append(heads)
+        return v
+    tensors = [torch.randn(1, 17, 128, dtype=torch.bfloat16).to('hpu') for _ in range(3)]
+    with torch.no_grad():
+        output = qwen.attention(*(qwen.AttentionTensorContainer(t) for t in tensors), 4,
+                                transformer_options={'optimized_attention_override': override})
+    torch.testing.assert_close(output.cpu(), tensors[2].cpu(), rtol=0, atol=0)
+    assert calls == [4]
+
+
+@pytest.mark.parametrize('additive', [False, True])
+def test_masked_prefix_keeps_eager_rounding(compiler, monkeypatch, additive):
+    monkeypatch.setattr(qwen, '_compiled_attention', lambda: pytest.fail('masked prefix must remain eager'))
+    q, k, v = torch.randn(3, 1, 17, 128, dtype=torch.bfloat16).to('hpu').unbind(0)
+    mask = torch.ones(17, 17, device='hpu', dtype=torch.bool).tril()
+    if additive:
+        mask = torch.where(mask, 0.0, -10000.0)
+    with torch.no_grad():
+        containers = (qwen.AttentionTensorContainer(t) for t in (q, k, v))
+        result = qwen.attention(*containers, 4, mask=mask)
+    assert torch.isfinite(result.cpu()).all()
