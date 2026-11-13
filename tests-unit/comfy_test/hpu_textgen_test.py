@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+import comfy.model_management
+from comfy.cli_args import args
+from comfy.text_encoders import llama
 from comfy.text_encoders.llama import BaseGenerate
 
 
@@ -58,3 +61,49 @@ def test_generate_updates_presence_penalty_mask(device, initial_tokens):
                                       top_k=1, top_p=1.0, presence_penalty=1.5,
                                       initial_tokens=initial_tokens, stop_tokens=[])
     assert result == ([1, 2, 3] if initial_tokens else [0, 1, 2])
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('top_k', [0, 20, 64])
+@pytest.mark.parametrize('masked', [False, True])
+@pytest.mark.parametrize('temperature,min_p,repetition_penalty', [(1.0, 0.0, 1.0), (.7, .05, 1.1)])
+def test_compiled_sampling_probabilities(dtype, top_k, masked, temperature, min_p, repetition_penalty, monkeypatch):
+
+    if not hasattr(torch, 'hpu') or not torch.hpu.is_available():
+        pytest.skip('HPU required')
+    torch._dynamo.reset()
+    monkeypatch.setattr(args, 'disable_comfy_compiler', False)
+    monkeypatch.setattr(comfy.model_management, 'in_training', False)
+    torch.manual_seed(103)
+    sampler = BaseGenerate()
+    with torch.no_grad():
+        for rows, vocab in [(1, 248320), (2, 257), (1, 248320)]:
+            logits = torch.randn(rows, vocab).to(device='hpu', dtype=dtype)
+            mask = (torch.arange(vocab) % 7 == 0).to('hpu') if masked else None
+            values = (temperature, top_k, .95, min_p, repetition_penalty, [], 1.5 if masked else 0.0, mask)
+            original, working = logits.clone(), logits.clone()
+            expected, expected_indices = sampler._processed_probs(original, *values)
+            actual, indices = sampler.processed_probs(working, *values)
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+            torch.testing.assert_close(working.cpu(), original.cpu(), rtol=0, atol=0)
+            if expected_indices is None:
+                assert indices is None
+            else:
+                torch.testing.assert_close(indices.cpu(), expected_indices.cpu(), rtol=0, atol=0)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize('mode', ['cpu', 'disabled', 'grad', 'history', 'training', 'temperature'])
+def test_sampling_compiler_bypass(mode, monkeypatch):
+
+    device = 'cpu' if mode == 'cpu' else 'hpu'
+    if device == 'hpu' and (not hasattr(torch, 'hpu') or not torch.hpu.is_available()):
+        pytest.skip('HPU required')
+    monkeypatch.setattr(llama, '_compiled_processed_probs', lambda: pytest.fail('sampling compiler must be bypassed'))
+    monkeypatch.setattr(args, 'disable_comfy_compiler', mode == 'disabled')
+    monkeypatch.setattr(comfy.model_management, 'in_training', mode == 'training')
+    logits = torch.randn(1, 97).to(device)
+    with torch.set_grad_enabled(mode == 'grad'):
+        probabilities, _ = BaseGenerate().processed_probs(logits, .7 if mode == 'temperature' else 1.0, 20, .95, .05, 1.1,
+                                                          [3, 3, 5] if mode == 'history' else [], .8)
+    assert torch.isfinite(probabilities.cpu()).all()

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional, Any, Tuple
 import math
 from tqdm import tqdm
@@ -1308,6 +1309,15 @@ class BaseGenerate:
         return generated_token_ids
 
     def processed_probs(self, logits, temperature, top_k, top_p, min_p, repetition_penalty, token_history, presence_penalty=0.0, penalty_mask=None):
+        if (logits.device.type == "hpu" and logits.dtype in (torch.bfloat16, torch.float32)
+                and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                and not torch.is_grad_enabled() and len(token_history) == 0 and temperature == 1.0):
+            return _compiled_processed_probs()(self, logits, temperature, top_k, top_p, min_p, repetition_penalty,
+                                               token_history, presence_penalty, penalty_mask)
+        return self._processed_probs(logits, temperature, top_k, top_p, min_p, repetition_penalty,
+                                     token_history, presence_penalty, penalty_mask)
+
+    def _processed_probs(self, logits, temperature, top_k, top_p, min_p, repetition_penalty, token_history, presence_penalty=0.0, penalty_mask=None):
         # returns (probs, indices); penalty_mask [vocab] bool stands in for token_history
         if penalty_active(repetition_penalty, presence_penalty):
             if penalty_mask is not None:
@@ -1356,6 +1366,11 @@ class BaseGenerate:
                 return top_indices.int().gather(1, next_token).long()
             return top_indices.gather(1, next_token)
         return next_token
+
+@lru_cache(maxsize=1)
+def _compiled_processed_probs():
+    return torch.compile(BaseGenerate._processed_probs, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
 
 class BaseQwen3:
     def logits(self, x):
