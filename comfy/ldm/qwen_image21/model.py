@@ -1,5 +1,6 @@
 # https://github.com/huggingface/diffusers (Apache 2.0) Qwen-Image 2.1
 import contextlib
+from functools import lru_cache
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +55,7 @@ class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, fused=True, dtype=None, device=None, operations=None):
         super().__init__()
         self.fused = fused
+        self.hpu_compile = operations in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
         if fused:
             # [gate; up] in one GEMM, the SiLU-gate folded into the down projection's input quantizer
             self.gate_up = operations.Linear(dim, 2 * hidden_dim, bias=False, dtype=dtype, device=device)
@@ -63,9 +65,21 @@ class SwiGLUFeedForward(nn.Module):
         self.out = operations.Linear(hidden_dim, dim, bias=False, dtype=dtype, device=device)
 
     def forward(self, x):
+        if (self.hpu_compile and x.device.type == "hpu" and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
+                and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                and not comfy.ops.has_forward_hooks(self)):
+            return _compiled_ffn()(self, x)
+        return self._forward(x)
+
+    def _forward(self, x):
         if self.fused:
             return comfy.ops.linear_input_act(self.out, self.gate_up(x), "swiglu")
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
+
+
+@lru_cache(maxsize=1)
+def _compiled_ffn():
+    return torch.compile(SwiGLUFeedForward._forward, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
 class Attention(nn.Module):
