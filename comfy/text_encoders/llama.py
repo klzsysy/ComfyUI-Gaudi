@@ -1286,14 +1286,15 @@ class BaseGenerate:
                 logits = self.logits(x)[:, -1]
                 if penalty_mask is None and penalize:
                     # allocated on the (unbracketed) first step; later steps only index_fill_ it
+                    # Integer fill values also support Habana 1.24.2, which rejects bool scalars in index_fill_.
                     penalty_mask = torch.zeros((logits.shape[-1],), dtype=torch.bool, device=device)
                     if len(initial_tokens) > 0:
-                        penalty_mask.index_fill_(0, torch.tensor(initial_tokens, device=device), True)
+                        penalty_mask.index_fill_(0, torch.tensor(initial_tokens, device=device), 1)
                 next_token = self.sample_token(logits, temperature, top_k, top_p, min_p, repetition_penalty, [], generator, do_sample=do_sample, presence_penalty=presence_penalty, penalty_mask=penalty_mask)
 
                 decode_tokens.copy_(next_token)
                 if penalty_mask is not None:
-                    penalty_mask.index_fill_(0, decode_tokens[0], True)
+                    penalty_mask.index_fill_(0, decode_tokens[0], 1)
                 del next_token, logits, x, embeds, position_ids
                 if step > 0 and compile_allocations:
                     comfy.model_prefetch.malloc_graph_end()

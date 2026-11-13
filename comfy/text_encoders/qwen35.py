@@ -1032,6 +1032,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         else:
             nt_buf.copy_(self.sample_token(lg0, sampling["temperature"], sampling["top_k"], sampling["top_p"], sampling["min_p"],
                                            1.0, [], generator))
+        # Integer fill values also support Habana 1.24.2 boolean masks.
         pen_mask = torch.zeros((lg0.shape[-1],), device=device, dtype=torch.bool) if penalized else None
         h_buf.copy_(x[:, -1:, :])
         del x, lg0
@@ -1041,7 +1042,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             vbar.set_watermark(vbar.max_size)
         ids = [nt_buf[0].item()]
         if penalized:
-            pen_mask.index_fill_(0, nt_buf.reshape(-1), True)
+            pen_mask.index_fill_(0, nt_buf.reshape(-1), 1)
         pos = embeds.shape[1]
         progress = comfy.utils.ProgressBar(max_length)
         console = tqdm(total=max_length, desc="Generating tokens", initial=1)
@@ -1120,7 +1121,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 mask = pen_mask.unsqueeze(0).repeat(tree.rows, 1)
                 for r in range(1, tree.rows):
                     mask[r].copy_(mask[tree.parent[r]])
-                    mask[r].index_fill_(0, verify_tokens[:, r], True)
+                    mask[r].index_fill_(0, verify_tokens[:, r], 1)
                 rows = torch.where(mask, apply_penalty(rows, repetition_penalty, presence_penalty), rows)
             if s is None:
                 return rows.argmax(dim=-1).unsqueeze(0)
@@ -1207,8 +1208,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             h_buf.copy_(x[:, row:row + 1, :])
             if penalized:
                 for r in path[1:]:
-                    pen_mask.index_fill_(0, verify_tokens[:, r], True)
-                pen_mask.index_fill_(0, nt_buf.reshape(-1), True)
+                    pen_mask.index_fill_(0, verify_tokens[:, r], 1)
+                pen_mask.index_fill_(0, nt_buf.reshape(-1), 1)
             pos += len(commit)
             return commit, ranks
 

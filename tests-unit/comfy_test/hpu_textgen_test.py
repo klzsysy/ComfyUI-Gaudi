@@ -29,3 +29,32 @@ def test_sample_token_vocabulary_indices(device, dtype, top_k):
     torch.testing.assert_close(result.cpu(), sample().cpu(), rtol=0, atol=0)
     if top_k == 1:
         torch.testing.assert_close(result.cpu(), allowed[:, 1:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "hpu"])
+@pytest.mark.parametrize("initial_tokens", [[], [0, 0]])
+def test_generate_updates_presence_penalty_mask(device, initial_tokens):
+    if device == "hpu" and (not hasattr(torch, "hpu") or not torch.hpu.is_available()):
+        pytest.skip("Requires an HPU")
+
+    class Model:
+        graph_dynamic_vbar_blocks = False
+        embed_tokens = torch.nn.Embedding(8, 4, device=device)
+
+        def init_kv_cache(self, *args):
+            return None
+
+        def forward(self, _, embeds, past_key_values, **kwargs):
+            return embeds, None, past_key_values
+
+    class Generator(BaseGenerate):
+        model = Model()
+
+        def logits(self, x):
+            return torch.tensor([[[1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]]], device=device)
+
+    with torch.no_grad():
+        result = Generator().generate(embeds=torch.zeros(1, 1, 4, device=device), max_length=3,
+                                      top_k=1, top_p=1.0, presence_penalty=1.5,
+                                      initial_tokens=initial_tokens, stop_tokens=[])
+    assert result == ([1, 2, 3] if initial_tokens else [0, 1, 2])
