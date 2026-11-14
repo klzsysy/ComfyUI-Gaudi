@@ -75,13 +75,16 @@ def test_region_preserves_outputs_state_and_updated_weights(hpu_compiler, batch)
 
 
 @pytest.mark.parametrize("target", ["module", "projection", "output", "global"])
-def test_region_honors_hooks_added_after_compilation(hpu_compiler, monkeypatch, target):
+@pytest.mark.parametrize("rows", [1, 8])
+def test_region_honors_hooks_added_after_compilation(hpu_compiler, monkeypatch, target, rows):
     layer = make_layer()
     calls = []
     with torch.no_grad():
         cache = make_cache(layer)
-        cache.prepare(8)
-        x = torch.randn(1, 8, 64, dtype=torch.bfloat16, device="hpu")
+        if rows == 1:
+            cache.ctl_tracker["tree"] = None
+        cache.prepare(rows)
+        x = torch.randn(1, rows, 64, dtype=torch.bfloat16, device="hpu")
         layer(x, past_key_value=cache)
         monkeypatch.setattr(qwen35, "_compiled_hpu_delta", lambda: pytest.fail("Hooked region compiled"))
         watched = layer if target == "module" else layer.in_proj_z if target == "projection" else layer.out_proj
@@ -91,11 +94,41 @@ def test_region_honors_hooks_added_after_compilation(hpu_compiler, monkeypatch, 
         handle = torch.nn.modules.module.register_module_forward_hook(hook) if target == "global" else watched.register_forward_hook(hook)
         try:
             cache = make_cache(layer)
-            cache.prepare(8)
+            if rows == 1:
+                cache.ctl_tracker["tree"] = None
+            cache.prepare(rows)
             output, _ = layer(x, past_key_value=cache)
             assert torch.isfinite(output).all() and calls == [True]
         finally:
             handle.remove()
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_single_token_core_preserves_state_and_rounding(hpu_compiler, monkeypatch, batch):
+    layer = make_layer()
+    compiler = qwen35._compiled_hpu_delta_core
+    with torch.no_grad():
+        eager, compiled = make_cache(layer, batch), make_cache(layer, batch)
+        for cache in (eager, compiled):
+            cache.ctl_tracker["tree"] = None
+        for turn in range(4):
+            for cache in (eager, compiled):
+                cache.prepare(1)
+            x = torch.randn(batch, 1, 64, dtype=torch.bfloat16, device="hpu")
+            monkeypatch.setattr(qwen35, "_compiled_hpu_delta_core", lambda: qwen35.GatedDeltaNet._decode)
+            expected, _ = layer(x, past_key_value=eager)
+            monkeypatch.setattr(qwen35, "_compiled_hpu_delta_core", compiler)
+            actual, state = layer(x, past_key_value=compiled)
+            assert state is compiled
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+            for attr in ("key", "value", "qkv_buf", "proj_buf", "gates_buf", "sumsq_buf"):
+                torch.testing.assert_close(getattr(compiled, attr).cpu(), getattr(eager, attr).cpu(), atol=0, rtol=0)
+            for cache in (eager, compiled):
+                cache.advance(1)
+                if turn == 1:
+                    cache.rollback(1)
+            if turn == 2:
+                layer.in_proj_z.weight.mul_(0.75)
 
 
 @pytest.mark.parametrize("mode", ["cpu", "fp32", "four_rows", "single_row", "training", "grad", "disabled", "custom_ops", "no_cache", "prefill"])
