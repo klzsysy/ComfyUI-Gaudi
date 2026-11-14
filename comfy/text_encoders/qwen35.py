@@ -381,6 +381,7 @@ class GatedDeltaNet(nn.Module):
 
         self.norm = RMSNormGated(self.value_head_dim, eps=config.rms_norm_eps, device=device, dtype=dtype)
         self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
+        self.hpu_compile_decode_core = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
 
     def forward(self, x, past_key_value=None, **kwargs):
         if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode
@@ -402,25 +403,14 @@ class GatedDeltaNet(nn.Module):
             proj, z = qkvz.split((self.key_dim * 2 + self.value_dim, self.value_dim), dim=-1)
 
         if past_key_value is not None and past_key_value.decode_step(seq_len):
-            # decode: conv step into the side buffer, then gates + delta rule + gated norm in one
-            # kernel; both first commit the previous step's accepted tokens
             kv = past_key_value
-            conv_step = comfy_kitchen.deltanet_conv_step_deferred
-            delta_step = comfy_kitchen.gated_delta_decode_deferred
-            if x.device.type == "hpu" and not comfy.model_management.args.disable_comfy_compiler:
-                conv_step, delta_step = hpu_gated_delta.compiled_ops()
-            with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
-                conv_step(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
-            with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
-                 comfy.ops.CastBiasWeightContext(self.in_proj_b, x, offloadable=True) as (w_b, _):
-                if isinstance(w_a, QuantizedTensor):
-                    w_a = w_a.dequantize()
-                if isinstance(w_b, QuantizedTensor):
-                    w_b = w_b.dequantize()
-                core_attn_out = delta_step(
-                    x, w_a, w_b, kv.dt_bias, kv.g_decay, kv.recurrent_state,
-                    self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, kv.norm_weight, self.norm.eps,
-                    kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl)
+            if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode_core
+                    and seq_len == 1 and type(kv) is LinearKV
+                    and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
+                    and not torch.is_grad_enabled()):
+                core_attn_out = _compiled_hpu_delta_core()(self, x, proj, z, kv)
+            else:
+                core_attn_out = self._decode(x, proj, z, kv)
             return self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1)), past_key_value
 
         mixed_qkv = proj.transpose(1, 2)  # [B, conv_dim, seq_len]
@@ -477,10 +467,34 @@ class GatedDeltaNet(nn.Module):
         output = self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
         return output, present_key_value
 
+    def _decode(self, x, proj, z, kv):
+        conv_step = comfy_kitchen.deltanet_conv_step_deferred
+        delta_step = comfy_kitchen.gated_delta_decode_deferred
+        if x.device.type == "hpu" and not comfy.model_management.args.disable_comfy_compiler:
+            conv_step, delta_step = hpu_gated_delta.compiled_ops()
+        with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (conv_weight, conv_bias):
+            conv_step(proj, kv.conv_state, conv_weight, conv_bias, kv.proj_buf, kv.qkv_buf, kv.ctl)
+        with comfy.ops.CastBiasWeightContext(self.in_proj_a, x, offloadable=True) as (w_a, _), \
+             comfy.ops.CastBiasWeightContext(self.in_proj_b, x, offloadable=True) as (w_b, _):
+            if isinstance(w_a, QuantizedTensor):
+                w_a = w_a.dequantize()
+            if isinstance(w_b, QuantizedTensor):
+                w_b = w_b.dequantize()
+            core_attn_out = delta_step(
+                x, w_a, w_b, kv.dt_bias, kv.g_decay, kv.recurrent_state,
+                self.key_dim, self.num_key_heads, self.key_head_dim ** -0.5, z, kv.norm_weight, self.norm.eps,
+                kv.qkv_buf, kv.gates_buf, kv.sumsq_buf, kv.ctl)
+        return core_attn_out
 
 @lru_cache(maxsize=1)
 def _compiled_hpu_delta():
     return torch.compile(GatedDeltaNet._forward, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+@lru_cache(maxsize=1)
+def _compiled_hpu_delta_core():
+    # Keep the input and output GEMMs outside this region to preserve their BF16 rounding.
+    return torch.compile(GatedDeltaNet._decode, backend="hpu_backend", dynamic=False, options={"force_static_compile": True})
 
 
 # GatedAttention - Full Attention with output gating
@@ -614,6 +628,7 @@ class Qwen35TransformerBlock(nn.Module):
             self.self_attn = GatedAttention(config, device=device, dtype=dtype, ops=ops)
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
         self.hpu_compile_mlp = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
+        self.hpu_compile_mlp_residual = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 
@@ -629,6 +644,8 @@ class Qwen35TransformerBlock(nn.Module):
         if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_mlp
                 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
                 and past_key_value is not None and x.shape[1] <= SPEC_ROWS):
+            if x.shape[1] == 1 and self.hpu_compile_mlp_residual and not torch.is_grad_enabled():
+                return hpu_mlp.forward(self.mlp, x, self.post_attention_layernorm, residual=True), present_key_value
             mlp_output = hpu_mlp.forward(self.mlp, x, self.post_attention_layernorm)
         else:
             mlp_output = self.mlp(x, norm=self.post_attention_layernorm)

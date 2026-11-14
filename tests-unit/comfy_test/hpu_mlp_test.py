@@ -77,6 +77,35 @@ class ZeroAttention(torch.nn.Module):
         return torch.zeros_like(x), past_key_value
 
 
+@pytest.mark.parametrize("merged", [False, True])
+def test_single_token_residual_preserves_rounding_and_alias(hpu_compiler, merged):
+    module = make_mlp(merged)
+    norm = RMSNorm(32, eps=1e-6, add=True, dtype=torch.float32, device="hpu")
+    norm.weight.data.fill_(0.01)
+    with torch.no_grad():
+        for _ in range(3):
+            x = torch.randn(1, 1, 32, dtype=torch.bfloat16, device="hpu")
+            expected = x + hpu_mlp.forward(module, x, norm)
+            actual = hpu_mlp.forward(module, x, norm, residual=True)
+            assert actual.data_ptr() == x.data_ptr()
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+            module.down_proj.weight.mul_(0.75)
+
+
+def test_residual_preserves_late_hook(hpu_compiler):
+    module = make_mlp()
+    x = torch.ones(1, 1, 32, dtype=torch.bfloat16, device="hpu")
+    with torch.no_grad():
+        hpu_mlp.forward(module, x.clone(), None, residual=True)
+        hook = module.register_forward_hook(lambda child, values, output: output * 0.5)
+        try:
+            expected = x + module(x)
+            actual = hpu_mlp.forward(module, x.clone(), None, residual=True)
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+        finally:
+            hook.remove()
+
+
 class CustomOps(comfy.ops.manual_cast):
     pass
 
