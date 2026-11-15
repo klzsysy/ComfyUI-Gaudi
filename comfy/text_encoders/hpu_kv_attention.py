@@ -7,6 +7,16 @@ from comfy_kitchen.backends.eager.rope import apply_rope_split_half
 
 import comfy.model_management
 
+if comfy.model_management.hpu_available:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+
+
+def single_decode(q, key, value, length):
+    visible = torch.arange(key.shape[2], device=q.device).view(1, 1, 1, -1) < length.view(-1, 1, 1, 1)
+    mask = torch.zeros(visible.shape, device=q.device, dtype=q.dtype).masked_fill(~visible, float("-inf"))
+    output = FusedSDPA.apply(q, key, value, mask, 0.0, False, None, "fp32", False)
+    return output.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
+
 
 def _decode(q, key, value, length):
     return comfy_kitchen.flash_attention_decode_gqa(q, key, value, length)
@@ -52,7 +62,8 @@ def _rope_split_half(xq, xk, freqs_cis):
             and xq.shape[-2] == xk.shape[-2]
             and not comfy.model_management.args.disable_comfy_compiler
             and not comfy.model_management.in_training and not torch.is_grad_enabled()):
-        return _compiled_rope()(xq, xk, freqs_cis)
+        function = _rope_forward if torch.compiler.is_compiling() else _compiled_rope()
+        return function(xq, xk, freqs_cis)
     return apply_rope_split_half(xq, xk, freqs_cis)
 
 

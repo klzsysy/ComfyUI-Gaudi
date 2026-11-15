@@ -23,5 +23,6 @@ def forward(module, x, norm, residual=False):
     if comfy.ops.has_forward_hooks(module) or (norm is not None and comfy.ops.has_forward_hooks(norm)):
         output = module(x, norm=norm)
         return torch.add(x, output, out=x) if residual else output
-    result = _compiled_forward()(module, x, norm, residual)
+    function = _forward if torch.compiler.is_compiling() else _compiled_forward()
+    result = function(module, x, norm, residual)
     return result[0] if residual else result

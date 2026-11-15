@@ -20,7 +20,7 @@ from comfy import sd1_clip
 import comfy.text_encoders.qwen_vl
 
 from .llama import SPEC_ROWS, BaseLlama, BaseGenerate, FixedKV, FixedKVCache, Int8FixedKVCache, Llama2_, MLP, RMSNorm as LlamaRMSNorm, apply_penalty, apply_rope, penalty_active, precompute_freqs_cis, rope_matrix
-from . import hpu_gated_delta, hpu_mlp
+from . import hpu_gated_delta, hpu_kv_attention, hpu_mlp
 
 
 @lru_cache(maxsize=1)
@@ -33,7 +33,7 @@ class RMSNorm(LlamaRMSNorm):
         if (x.device.type == "hpu" and x.dtype in (torch.bfloat16, torch.float32)
                 and not comfy.model_management.args.disable_comfy_compiler
                 and not comfy.model_management.in_training and not torch.is_grad_enabled()
-                and not comfy.ops.has_forward_hooks(self)):
+                and not comfy.ops.has_forward_hooks(self) and not torch.compiler.is_compiling()):
             return _compiled_hpu_rms_norm()(self, x)
         return super().forward(x)
 
@@ -109,6 +109,27 @@ class LinearKV(FixedKV):
     @property
     def recurrent_state(self):
         return self.value
+
+
+class ImmediateLinearKV(LinearKV):
+    """Request-local state for a single-token HPU decoder with no rollback."""
+
+
+class HPUSingleTokenKV(FixedKVCache):
+    def attend(self, xq, xk, xv):
+        return hpu_kv_attention.single_decode(xq, self.key, self.value, self.seqlen)
+
+
+def _hpu_decode(model, hidden, rotary, caches):
+    for layer, cache in zip(model.layers, caches):
+        hidden, _ = layer(hidden, freqs_cis=rotary, past_key_value=cache)
+    return model.norm(hidden)
+
+
+@lru_cache(maxsize=1)
+def _compiled_hpu_decode():
+    return torch.compile(_hpu_decode, backend="hpu_backend", fullgraph=True, dynamic=False,
+                         options={"force_static_compile": True})
 
 
 class VerifyTree:
@@ -404,7 +425,9 @@ class GatedDeltaNet(nn.Module):
 
         if past_key_value is not None and past_key_value.decode_step(seq_len):
             kv = past_key_value
-            if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode_core
+            if type(kv) is ImmediateLinearKV:
+                core_attn_out = self._decode_single(x, proj, z, kv)
+            elif (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode_core
                     and seq_len == 1 and type(kv) is LinearKV
                     and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
                     and not torch.is_grad_enabled()):
@@ -466,6 +489,39 @@ class GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.value_head_dim), z.reshape(-1, self.value_head_dim))
         output = self.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
         return output, present_key_value
+
+    def _decode_single(self, x, proj, z, cache):
+        batch, _, channels = proj.shape
+        heads = self.num_value_heads
+        width = self.key_head_dim
+        groups = heads // self.num_key_heads
+        with comfy.ops.CastBiasWeightContext(self.conv1d, proj, offloadable=True) as (weight, bias):
+            window = torch.cat((cache.conv_state, proj.transpose(1, 2)), dim=-1)
+            accumulation = (window.float().flip(-1) * weight.reshape(channels, -1).float().flip(-1)).sum(-1)
+            if bias is not None:
+                accumulation = accumulation + bias
+            rounded = accumulation.to(x.dtype).float()
+            convolved = (rounded / (1.0 + torch.exp(-rounded))).to(x.dtype)
+            cache.conv_state.copy_(window[..., 1:])
+        query, key, value = convolved.split((self.key_dim, self.key_dim, self.value_dim), dim=-1)
+        query = query.reshape(batch, self.num_key_heads, width).float()
+        key = key.reshape(batch, self.num_key_heads, width).float()
+        value = value.reshape(batch, heads, self.value_head_dim).float()
+        query = query / query.square().sum(-1, keepdim=True).sqrt().clamp(min=1e-12) * width ** -0.5
+        key = key / key.square().sum(-1, keepdim=True).sqrt().clamp(min=1e-12)
+        query = query.repeat_interleave(groups, dim=1)
+        key = key.repeat_interleave(groups, dim=1)
+        beta = self.in_proj_b(x).sigmoid().float().reshape(batch, heads, 1)
+        decay = torch.exp(cache.g_decay * F.softplus(self.in_proj_a(x).float() + cache.dt_bias)).reshape(batch, heads, 1)
+        state = cache.recurrent_state
+        prediction = (key.unsqueeze(-1) * state).sum(-2)
+        update = beta * (value - decay * prediction)
+        output = decay * (query.unsqueeze(-1) * state).sum(-2) + (query * key).sum(-1, keepdim=True) * update
+        state.copy_(state * decay.unsqueeze(-1) + key.unsqueeze(-1) * update.unsqueeze(-2))
+        output = output.to(x.dtype).float()
+        rstd = torch.rsqrt(output.square().mean(-1, keepdim=True) + self.norm.eps)
+        normalized = (output * rstd * cache.norm_weight.float()).to(x.dtype)
+        return (normalized * F.silu(z.reshape(batch, heads, self.value_head_dim))).unsqueeze(1)
 
     def _decode(self, x, proj, z, kv):
         conv_step = comfy_kitchen.deltanet_conv_step_deferred
@@ -1001,6 +1057,62 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         "seed": seed if seed is not None else 42}
         return self._generate_mtp(embeds, max_length, stop_tokens, mtp, sampling=sampling, position_ids=kwargs.get("position_ids"),
                                   repetition_penalty=repetition_penalty, presence_penalty=kwargs.get("presence_penalty", 0.0) or 0.0)
+
+    def _generation_forward(self, embeds, past_key_values):
+        original = self.model.forward
+        if (embeds.device.type != "hpu" or embeds.dtype != torch.bfloat16 or embeds.shape[0] != 1
+                or self.mtp is not None or type(self.model) is not Qwen35Transformer
+                or comfy.model_management.args.disable_comfy_compiler or comfy.model_management.in_training
+                or torch.is_grad_enabled() or comfy.model_management.comfy_kitchen_attention_enabled()
+                or "forward" in self.model.__dict__ or comfy.ops.has_forward_hooks(self.model)):
+            return original
+        if any(parameter.device != embeds.device or parameter.dtype != torch.bfloat16
+               for parameter in self.model.parameters()):
+            return original
+        for layer, cache in zip(self.model.layers, past_key_values):
+            if not layer.hpu_compile_mlp_residual:
+                return original
+            if layer.layer_type == "linear_attention":
+                if type(cache) is not LinearKV or not layer.linear_attn.hpu_compile_decode_core:
+                    return original
+            elif type(cache) is not FixedKVCache or layer.self_attn.comfy_attention.method is not None:
+                return original
+        for module in self.model.modules():
+            if isinstance(module, comfy.ops.CastWeightBiasOp):
+                if (module.weight_function or module.bias_function or hasattr(module, "_v")
+                        or getattr(module, "weight_lowvram_function", None) is not None
+                        or getattr(module, "bias_lowvram_function", None) is not None):
+                    return original
+        proxies = None
+
+        def forward(*values, **kwargs):
+            nonlocal proxies
+            current = kwargs.get("embeds")
+            caches = kwargs.get("past_key_values")
+            if current is None or current.shape[1] != 1 or not caches or caches[0].index == 0:
+                return original(*values, **kwargs)
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            if proxies is None:
+                proxies = []
+                for cache in caches:
+                    if type(cache) is LinearKV:
+                        proxy = ImmediateLinearKV(cache.key, cache.value, 1, None, None,
+                                                  cache.g_decay, cache.dt_bias, cache.norm_weight)
+                    else:
+                        proxy = HPUSingleTokenKV(cache.key, cache.value, 1, cache.position, cache.seqlen, {"tree": None})
+                    proxies.append(proxy)
+            for cache in caches:
+                cache.prepare(1)
+            positions = kwargs.get("position_ids")
+            if positions is None:
+                positions = torch.arange(caches[0].index, caches[0].index + 1, device=current.device).unsqueeze(0)
+            rotary = rope_matrix(self.model.compute_freqs_cis(positions, current.device))
+            hidden = _compiled_hpu_decode()(self.model, current.clone(), rotary, proxies)
+            for cache in caches:
+                cache.advance(1)
+            return hidden, None, caches
+
+        return forward
 
     def _generate_mtp(self, embeds, max_length, stop_tokens, mtp, sampling=None, position_ids=None, repetition_penalty=1.0, presence_penalty=0.0):
         device = embeds.device
