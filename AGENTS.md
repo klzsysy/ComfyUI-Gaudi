@@ -1,3 +1,15 @@
+## Gaudi2 Optimization Delivery Workflow
+
+Unless the user explicitly specifies otherwise, optimization tasks coordinated with the sibling gaudi2 repository follow this default workflow.
+
+1. Complete implementation and relevant automated validation.
+2. Stage this task's changes in both repositories with `git add` and keep them staged pending human acceptance.
+3. Deploy the validated staged version to the configured environment, verify normal operation, and provide the user with the results for review.
+4. Wait for the user's explicit confirmation that human acceptance has passed. Requested revisions follow the same validation, staging, deployment, and review cycle.
+5. Commit the accepted task changes in both repositories only after that confirmation. Creating or amending commits before human acceptance requires an explicit exception from the user.
+
+The sibling gaudi2 repository owns investigation and deployment records, including the baseline commit and deployed file hashes for a staged version awaiting acceptance.
+
 ## Engineering Style
 
 - Keep changes small and direct. Most fixes should touch the narrowest code path
