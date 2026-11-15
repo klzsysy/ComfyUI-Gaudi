@@ -1,10 +1,17 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 import comfy.model_management
 import comfy.ops
 from comfy.cli_args import args
 from comfy.text_encoders import hpu_kv_attention, qwen35
+
+
+def test_decode_preserves_optional_final_norm():
+    x = torch.ones(1, 1, 64)
+    model = SimpleNamespace(layers=[], norm=None)
+    assert qwen35._hpu_decode(model, x, None, []) is x
 
 
 @pytest.fixture
