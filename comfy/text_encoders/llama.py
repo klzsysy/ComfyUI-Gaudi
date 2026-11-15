@@ -1207,6 +1207,9 @@ class BaseGenerate:
     def init_kv_cache(self, batch, max_cache_len, device, execution_dtype):
         return self.model.init_kv_cache(batch, max_cache_len, device, execution_dtype)
 
+    def _generation_forward(self, embeds, past_key_values):
+        return self.model.forward
+
     def generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0, initial_input_ids=None, position_ids=None, deepstack_embeds=None, visual_pos_masks=None, embeds_info=None):
         device = embeds.device
 
@@ -1225,6 +1228,7 @@ class BaseGenerate:
 
         max_cache_len = embeds.shape[1] + max_length
         past_key_values = self.init_kv_cache(embeds.shape[0], max_cache_len, device, execution_dtype)
+        generation_forward = self._generation_forward(embeds, past_key_values)
 
         generator = torch.Generator(device=device).manual_seed(seed) if do_sample else None
 
@@ -1272,7 +1276,7 @@ class BaseGenerate:
                 if step == 0 and deepstack_embeds is not None:
                     extra["deepstack_embeds"] = deepstack_embeds
                     extra["visual_pos_masks"] = visual_pos_masks
-                x, _, past_key_values = self.model.forward(None, embeds=embeds, attention_mask=None, past_key_values=past_key_values, input_ids=current_input_ids, position_ids=position_ids, **extra, embeds_info=(embeds_info if step == 0 else None))
+                x, _, past_key_values = generation_forward(None, embeds=embeds, attention_mask=None, past_key_values=past_key_values, input_ids=current_input_ids, position_ids=position_ids, **extra, embeds_info=(embeds_info if step == 0 else None))
                 logits = self.logits(x)[:, -1]
                 if penalty_mask is None and do_sample and penalize:
                     # Integer fill values also support Habana 1.24.2, which rejects bool scalars in index_fill_.
