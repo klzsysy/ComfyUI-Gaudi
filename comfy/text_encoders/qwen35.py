@@ -122,7 +122,7 @@ class HPUSingleTokenKV(FixedKVCache):
 def _hpu_decode(model, hidden, rotary, caches):
     for layer, cache in zip(model.layers, caches):
         hidden, _ = layer(hidden, freqs_cis=rotary, past_key_value=cache)
-    return model.norm(hidden)
+    return model.norm(hidden) if model.norm is not None else hidden
 
 
 @lru_cache(maxsize=1)
