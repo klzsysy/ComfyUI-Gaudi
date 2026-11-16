@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import torch
 from types import SimpleNamespace
@@ -26,7 +28,7 @@ def hpu(monkeypatch):
     torch._dynamo.reset()
 
 
-def generator(device="hpu", dtype=torch.bfloat16):
+def generator(device="hpu", dtype=torch.bfloat16, quantized=False):
     config = qwen35.Qwen35Config(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
                                 num_attention_heads=2, num_key_value_heads=1, linear_num_key_heads=2,
                                 linear_num_value_heads=4, layer_types=qwen35._qwen35_layer_types(4))
@@ -36,14 +38,26 @@ def generator(device="hpu", dtype=torch.bfloat16):
     result.mtp = None
     for parameter in result.model.parameters():
         parameter.data.zero_()
+    if quantized:
+        state = result.model.state_dict()
+        for name, module in result.model.named_modules():
+            if isinstance(module, torch.nn.Linear) and not name.endswith(('in_proj_a', 'in_proj_b')):
+                state[name + '.weight'] = state[name + '.weight'].cpu().to(torch.float8_e4m3fn)
+                state[name + '.weight_scale'] = torch.ones(())
+                state[name + '.comfy_quant'] = torch.tensor(list(json.dumps({'format': 'float8_e4m3fn'}).encode()), dtype=torch.uint8)
+        operations = comfy.ops.mixed_precision_ops({'formats': ['float8_e4m3fn']}, dtype, load_device=torch.device('hpu'))
+        result.model = qwen35.Qwen35Transformer(config, device='cpu', dtype=dtype, ops=operations)
+        result.model.load_state_dict(state)
+        result.model.to(device)
     caches = result.init_kv_cache(1, 32, device, dtype)
     for cache in caches:
         cache.index = 17
     return result, caches
 
 
-def test_generation_owns_cache_views_and_preserves_model_forward(hpu, monkeypatch):
-    model, caches = generator()
+@pytest.mark.parametrize("quantized", [False, True])
+def test_generation_owns_cache_views_and_preserves_model_forward(hpu, monkeypatch, quantized):
+    model, caches = generator(quantized=quantized)
     x = torch.ones(1, 1, 64, device="hpu", dtype=torch.bfloat16)
     observed = []
     original_calls = []
@@ -93,10 +107,11 @@ def test_generation_owns_cache_views_and_preserves_model_forward(hpu, monkeypatc
 
 @pytest.mark.parametrize("mode", ["cpu", "fp32", "batch", "mtp", "disabled", "training", "grad",
                                   "hook", "patched", "lowvram", "vbar", "attention", "kitchen", "forward", "offloaded"])
-def test_generation_retains_existing_routes(hpu, monkeypatch, mode):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_generation_retains_existing_routes(hpu, monkeypatch, mode, quantized):
     device = "cpu" if mode == "cpu" else "hpu"
     dtype = torch.float32 if mode == "fp32" else torch.bfloat16
-    model, caches = generator(device, dtype)
+    model, caches = generator(device, dtype, quantized)
     x = torch.ones(2 if mode == "batch" else 1, 1, 64, device=device, dtype=dtype)
     monkeypatch.setattr(args, "disable_comfy_compiler", mode == "disabled")
     monkeypatch.setattr(args, "use_ck_attention", mode == "kitchen")
@@ -151,3 +166,24 @@ def test_generation_checks_interruption_before_updating_state(hpu, monkeypatch):
         with pytest.raises(RuntimeError, match="interrupted"):
             forward(None, embeds=x, past_key_values=caches)
     assert all(cache.index == 17 for cache in caches)
+
+
+def test_native_fp8_decoder_executes_and_advances(hpu):
+    model, caches = generator(quantized=True)
+    x = torch.ones(1, 1, 64, device="hpu", dtype=torch.bfloat16)
+    for cache in caches:
+        cache.key.zero_()
+        cache.value.zero_()
+        if type(cache) is qwen35.LinearKV:
+            cache.g_decay = torch.full((4,), -1., device="hpu")
+            cache.dt_bias = torch.zeros(4, device="hpu")
+            cache.norm_weight = torch.ones(128, device="hpu", dtype=torch.bfloat16)
+    with torch.no_grad():
+        forward = model._generation_forward(x, caches)
+        assert forward != model.model.forward
+        for index in (18, 19):
+            output, _, returned = forward(None, embeds=x, past_key_values=caches)
+            assert returned is caches
+            assert output.shape == x.shape and output.dtype == x.dtype
+            assert output.isfinite().all()
+            assert all(cache.index == index for cache in caches)
