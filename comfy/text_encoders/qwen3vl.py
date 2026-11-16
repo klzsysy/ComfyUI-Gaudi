@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from transformers import Qwen2Tokenizer
 
 from comfy import sd1_clip
+import comfy.model_management
+import comfy.ops
 import comfy.text_encoders.qwen_vl
 from .qwen35 import Qwen35VisionModel
 from .llama import BaseLlama, BaseQwen3, BaseGenerate, Llama2_, Qwen3VL_4BConfig, Qwen3VL_8BConfig, Qwen3VL_32BConfig
@@ -122,6 +124,13 @@ def _make_qwen3vl_model(model_type):
 
 class Qwen3VLClipModel(sd1_clip.SDClipModel):
     def __init__(self, device="cpu", layer="hidden", layer_idx=-1, dtype=None, attention_mask=True, model_options={}, model_type="qwen3vl_8b"):
+        quantization = model_options.get("quantization_metadata")
+        load_device = model_options.get("load_device", comfy.model_management.text_encoder_device())
+        if (load_device.type == "hpu" and quantization is not None
+                and quantization.get("formats") == ["float8_e4m3fn"] and model_options.get("custom_operations") is None):
+            model_options = model_options.copy()
+            model_options["custom_operations"] = comfy.ops.mixed_precision_ops(quantization, dtype, load_device=load_device)
+
         super().__init__(device=device, layer=layer, layer_idx=layer_idx, textmodel_json_config={},
                          dtype=dtype, special_tokens={"pad": 151643}, layer_norm_hidden_state=False,
                          model_class=_make_qwen3vl_model(model_type), enable_attention_masks=attention_mask,

@@ -55,7 +55,7 @@ class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, fused=True, dtype=None, device=None, operations=None):
         super().__init__()
         self.fused = fused
-        self.hpu_compile = operations in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile = operations in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(operations, "hpu_fp8", False)
         if fused:
             # [gate; up] in one GEMM, the SiLU-gate folded into the down projection's input quantizer
             self.gate_up = operations.Linear(dim, 2 * hidden_dim, bias=False, dtype=dtype, device=device)

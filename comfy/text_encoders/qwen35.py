@@ -401,7 +401,7 @@ class GatedDeltaNet(nn.Module):
 
         self.norm = RMSNormGated(self.value_head_dim, eps=config.rms_norm_eps, device=device, dtype=dtype)
         self.hpu_compile_decode = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
-        self.hpu_compile_decode_core = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile_decode_core = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_fp8", False)
 
     def forward(self, x, past_key_value=None, **kwargs):
         if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and self.hpu_compile_decode
@@ -683,7 +683,7 @@ class Qwen35TransformerBlock(nn.Module):
             self.self_attn = GatedAttention(config, device=device, dtype=dtype, ops=ops)
         self.mlp = MLP(config, device=device, dtype=dtype, ops=ops)
         self.hpu_compile_mlp = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_compile", False)
-        self.hpu_compile_mlp_residual = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init)
+        self.hpu_compile_mlp_residual = ops in (comfy.ops.manual_cast, comfy.ops.disable_weight_init) or getattr(ops, "hpu_fp8", False)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 

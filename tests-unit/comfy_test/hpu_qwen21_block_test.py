@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import torch
 
@@ -156,3 +158,33 @@ def test_masked_prefix_keeps_eager_rounding(compiler, monkeypatch, additive):
         containers = (qwen.AttentionTensorContainer(t) for t in (q, k, v))
         result = qwen.attention(*containers, 4, mask=mask)
     assert torch.isfinite(result.cpu()).all()
+
+
+def test_native_fp8_ffn_compilation_and_hooks(compiler, monkeypatch):
+    torch.manual_seed(83)
+    operations = comfy.ops.mixed_precision_ops({'formats': ['float8_e4m3fn']}, torch.bfloat16,
+                                               load_device=torch.device('hpu'))
+    module = qwen.SwiGLUFeedForward(128, 256, device='cpu', dtype=torch.bfloat16, operations=operations)
+    state = {}
+    weights = {}
+    for name, shape in [('gate_up', (512, 128)), ('out', (128, 256))]:
+        weight = (torch.randn(shape) * 20).to(torch.float8_e4m3fn)
+        state[name + '.weight'] = weight
+        state[name + '.weight_scale'] = torch.tensor(.002)
+        state[name + '.comfy_quant'] = torch.tensor(list(json.dumps({'format': 'float8_e4m3fn'}).encode()), dtype=torch.uint8)
+        weights[name] = weight.double() * state[name + '.weight_scale'].double()
+    module.load_state_dict(state)
+    module.to('hpu')
+    assert module.hpu_compile
+    with torch.no_grad():
+        x = torch.randn(1, 17, 128, device='hpu', dtype=torch.bfloat16)
+        gate, up = torch.nn.functional.linear(x.cpu().double(), weights['gate_up']).chunk(2, dim=-1)
+        reference = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, weights['out'])
+        actual = module(x).cpu().double()
+        relative = (actual-reference).norm() / reference.norm()
+        assert relative < .08
+        assert actual.isfinite().all()
+        module.out.register_forward_hook(lambda module, inputs, output: output * .5)
+        expected = module._forward(x).cpu()
+        monkeypatch.setattr(qwen, '_compiled_ffn', lambda: pytest.fail('hook must bypass compiler'))
+        torch.testing.assert_close(module(x).cpu(), expected, rtol=0, atol=0)
