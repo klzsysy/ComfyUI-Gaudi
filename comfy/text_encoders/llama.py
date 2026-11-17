@@ -1210,6 +1210,9 @@ class BaseGenerate:
     def _generation_forward(self, embeds, past_key_values):
         return self.model.forward
 
+    def _generation_readback_size(self, embeds, past_key_values):
+        return 1
+
     def generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0, initial_input_ids=None, position_ids=None, deepstack_embeds=None, visual_pos_masks=None, embeds_info=None):
         device = embeds.device
 
@@ -1229,10 +1232,12 @@ class BaseGenerate:
         max_cache_len = embeds.shape[1] + max_length
         past_key_values = self.init_kv_cache(embeds.shape[0], max_cache_len, device, execution_dtype)
         generation_forward = self._generation_forward(embeds, past_key_values)
+        readback_size = self._generation_readback_size(embeds, past_key_values)
 
         generator = torch.Generator(device=device).manual_seed(seed) if do_sample else None
 
         generated_token_ids = []
+        pending_tokens = []
         pbar = comfy.utils.ProgressBar(max_length)
 
         # MRoPE: prefill uses explicit 3D position_ids, decode continues from the last position
@@ -1292,8 +1297,14 @@ class BaseGenerate:
                 if step > 0 and compile_allocations:
                     comfy.model_prefetch.malloc_graph_end()
 
-                token_id = decode_tokens[0].item()
-                generated_token_ids.append(token_id)
+                if readback_size == 1:
+                    received = [decode_tokens[0].item()]
+                else:
+                    pending_tokens.append(decode_tokens[0].clone())
+                    received = []
+                    if len(pending_tokens) == readback_size or step + 1 == max_length:
+                        received = torch.stack(pending_tokens).reshape(-1).tolist()
+                        pending_tokens.clear()
 
                 if step == 0 and hasattr(self.model.embed_tokens, "_v"):
                     # prefill's transients can evict body pages and lower the VBAR watermark: let the decode fault them back
@@ -1303,10 +1314,11 @@ class BaseGenerate:
 
                 if step > 0 and next_pos is not None:
                     next_pos += 1
-                pbar.update(1)
-
-                if token_id in stop_tokens:
-                    break
+                for token_id in received:
+                    generated_token_ids.append(token_id)
+                    pbar.update(1)
+                    if token_id in stop_tokens:
+                        return generated_token_ids
         finally:
             comfy.model_prefetch.cleanup_prefetch_queues()
 

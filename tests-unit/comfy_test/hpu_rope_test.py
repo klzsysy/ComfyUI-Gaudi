@@ -42,6 +42,21 @@ def test_short_rope_preserves_noncontiguous_inputs_and_dynamic_lengths(hpu_rope)
     assert hpu_kv_attention._compiled_rope.cache_info().currsize == 1
 
 
+def test_qwen_native_rope_matches_standard_rotations(hpu_rope):
+    from comfy.text_encoders.llama import precompute_freqs_cis, rope_matrix
+    with torch.no_grad():
+        for position in (0, 17, 2803, 4712):
+            q, k, _ = inputs(1)
+            matrix = rope_matrix(precompute_freqs_cis(64, torch.tensor([[position]], device='hpu'), 10000000, device='hpu'))
+            actual = hpu_kv_attention.qwen_rope(q, k, matrix)
+            for source, output in zip((q, k), actual):
+                values = source.cpu().double()
+                frequencies = matrix.cpu().double()
+                expected = torch.cat((values[..., :32] * frequencies[..., 0, 0] + values[..., 32:] * frequencies[..., 0, 1],
+                                      values[..., 32:] * frequencies[..., 1, 1] + values[..., :32] * frequencies[..., 1, 0]), dim=-1)
+                torch.testing.assert_close(output.cpu().double(), expected, atol=1e-5, rtol=.004)
+
+
 @pytest.mark.parametrize("mode", ["disabled", "training", "grad", "prefill", "float32"])
 def test_rope_preserves_eager_paths(hpu_rope, monkeypatch, mode):
     monkeypatch.setattr(comfy.model_management.args, "disable_comfy_compiler", mode == "disabled")
