@@ -227,7 +227,9 @@ class QwenImage21FunControl(nn.Module):
 
 def _attention(q, k, v, heads, mask, transformer_options, preferred_attention):
     tensors = (AttentionTensorContainer(tensor) for tensor in (q, k, v))
-    return optimized_attention(*tensors, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention)
+    return optimized_attention(*tensors, heads, mask=mask, transformer_options=transformer_options,
+                               preferred_attention=preferred_attention,
+                               hpu_fast_attention=transformer_options.get("hpu_fast_attention", False))
 
 
 @lru_cache(maxsize=1)
@@ -240,6 +242,10 @@ def attention(q, k, v, heads, mask=None, transformer_options={}, preferred_atten
             and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training
             and "optimized_attention_override" not in transformer_options
             and (preferred_attention is None or preferred_attention.method is None)):
+        transformer_options = transformer_options.copy()
+        # The first layer is sensitive to fast softmax late in denoising.
+        transformer_options["hpu_fast_attention"] = (transformer_options.get("hpu_fast_attention", False)
+                                                     and transformer_options.get("block_index", 0) != 0)
         return _compiled_attention()(q.take(), k.take(), v.take(), heads, mask, transformer_options, preferred_attention)
     return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention)
 
@@ -372,6 +378,7 @@ class QwenImage21Transformer2DModel(nn.Module):
         self.dtype = dtype
         self.out_channels = out_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.hpu_fp8_attention = getattr(operations, "hpu_fp8", False)
 
         self.pe_embedder = EmbedND(dim=attention_head_dim, theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = TimestepProjEmbeddings(self.inner_dim, dtype=dtype, device=device, operations=operations)
@@ -472,6 +479,8 @@ class QwenImage21Transformer2DModel(nn.Module):
         ).execute(x, timestep, context, ref_latents, image_slots, transformer_options, **kwargs)
 
     def _forward(self, x, timesteps, context, ref_latents=None, image_slots=None, transformer_options={}, prefix_cache=None, **kwargs):
+        transformer_options = transformer_options.copy()
+        transformer_options.setdefault("hpu_fast_attention", self.hpu_fp8_attention)
         B, C, H, W = x.shape
         dtype = x.dtype
         ref_latents = list(ref_latents or [])
