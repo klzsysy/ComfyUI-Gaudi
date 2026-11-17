@@ -613,6 +613,27 @@ def _hpu_fp8_attention_av(q, k, v):
     return output[:q.shape[-2]].unsqueeze(0).unsqueeze(0)
 
 
+def _hpu_fast_attention(q, k, v):
+    k = (k.float() - k.float().mean(dim=-2, keepdim=True)).to(k.dtype)
+    q = q.contiguous()
+    split = k.shape[-2] // 128 * 128
+    scale = q.shape[-1] ** -0.5
+    if split == k.shape[-2]:
+        return torch.ops.hpu.sdpa_recomp_fwd(q, k.contiguous(), v.contiguous(), None, 0.0,
+                                            scale, False, True, "fast", None, "right")[0]
+    first, maximum1, inverse1 = torch.ops.hpu.sdpa_recomp_fwd(
+        q, k[..., :split, :].contiguous(), v[..., :split, :].contiguous(),
+        None, 0.0, scale, False, True, "fast", None, "right")[:3]
+    last, maximum2, inverse2 = torch.ops.hpu.sdpa_recomp_fwd(
+        q, k[..., split:, :].contiguous(), v[..., split:, :].contiguous(),
+        None, 0.0, scale, False, True, "fast", None, "right")[:3]
+    maximum = torch.maximum(maximum1.float(), maximum2.float())
+    weight1 = (maximum1.float() - maximum).exp() / inverse1.float()
+    weight2 = (maximum2.float() - maximum).exp() / inverse2.float()
+    share = (weight2 / (weight1 + weight2)).to(first.dtype)
+    return torch.addcmul(first, last - first, share)
+
+
 @wrap_attn
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     if skip_reshape:
@@ -635,6 +656,15 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
     sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
 
     if SDP_BATCH_LIMIT >= b:
+        hpu_fast_attention = (kwargs.get("hpu_fast_attention", False)
+                              and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
+                              and q.shape[:2] == (1, 32) and q.shape[-1] == 128 and q.shape[-2] >= 4096
+                              and k.shape == v.shape and k.shape[:2] == q.shape[:2]
+                              and k.shape[-1] == q.shape[-1] and k.shape[-2] >= 4096
+                              and mask is None and not sdpa_extra
+                              and get_attn_precision(attn_precision, q.dtype) != torch.float32
+                              and torch.compiler.is_compiling() and not args.disable_comfy_compiler
+                              and not torch.is_grad_enabled() and not model_management.in_training)
         fp8_attention = ((kwargs.get("transformer_options") or {}).get("fp8_attention", False)
                          and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
                          and q.shape[:2] == (1, 1) and q.shape[-1] == 128 and q.shape[-2] >= 4096
@@ -642,7 +672,9 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
                          and get_attn_precision(attn_precision, q.dtype) != torch.float32
                          and torch.compiler.is_compiling() and not args.disable_comfy_compiler
                          and not torch.is_grad_enabled() and not model_management.in_training)
-        if fp8_attention:
+        if hpu_fast_attention:
+            out = _hpu_fast_attention(q, k, v)
+        elif fp8_attention:
             out = _hpu_fp8_attention_av(q, k, v)
         else:
             out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
