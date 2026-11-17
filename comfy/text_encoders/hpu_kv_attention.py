@@ -55,6 +55,20 @@ def _rope_forward(xq, xk, freqs_cis):
     return _rotate_split_half(xq, freqs_cis), _rotate_split_half(xk, freqs_cis)
 
 
+def _native_rope_forward(query, key, frequencies):
+    cosine = torch.cat((frequencies[..., 0, 0], frequencies[..., 1, 1]), dim=-1)
+    sine = torch.cat((-frequencies[..., 0, 1], frequencies[..., 1, 0]), dim=-1)
+    query_out = torch.ops.hpu.rotary_pos_embedding(query.float(), sine, cosine, None, 0, 0)
+    key_out = torch.ops.hpu.rotary_pos_embedding(key.float(), sine, cosine, None, 0, 0)
+    return query_out.to(query.dtype), key_out.to(key.dtype)
+
+
+@lru_cache(maxsize=1)
+def _compiled_qwen_rope():
+    return torch.compile(_native_rope_forward, backend="hpu_backend", fullgraph=True, dynamic=False,
+                         options={"force_static_compile": True, "decomposition_mode": "none"})
+
+
 def _rope_split_half(xq, xk, freqs_cis):
     if (xq.dtype == xk.dtype == torch.bfloat16 and freqs_cis.dtype == torch.float32
             and xq.ndim == xk.ndim == 4 and freqs_cis.ndim == 6
@@ -69,3 +83,13 @@ def _rope_split_half(xq, xk, freqs_cis):
 
 if comfy.model_management.hpu_available:
     torch.library.register_kernel("comfy_kitchen::apply_rope_split_half", "hpu", _rope_split_half)
+
+    @torch.library.custom_op("comfy_hpu::qwen35_rope", mutates_args=(), device_types="hpu")
+    def qwen_rope(query: torch.Tensor, key: torch.Tensor, frequencies: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate using the equal diagonals and opposite sine terms produced by Qwen."""
+        return _compiled_qwen_rope()(query, key, frequencies)
+
+    @qwen_rope.register_fake
+    def _qwen_rope_meta(query, key, frequencies):
+        return (torch.empty_like(query, memory_format=torch.contiguous_format),
+                torch.empty_like(key, memory_format=torch.contiguous_format))

@@ -116,6 +116,8 @@ class ImmediateLinearKV(LinearKV):
 
 
 class HPUSingleTokenKV(FixedKVCache):
+    native_rope = False
+
     def attend(self, xq, xk, xv):
         return hpu_kv_attention.single_decode(xq, self.key, self.value, self.seqlen)
 
@@ -128,7 +130,7 @@ def _hpu_decode(model, hidden, rotary, caches):
 
 @lru_cache(maxsize=1)
 def _compiled_hpu_decode():
-    return torch.compile(_hpu_decode, backend="hpu_backend", fullgraph=True, dynamic=False,
+    return torch.compile(_hpu_decode, backend="hpu_backend", fullgraph=True, dynamic=None,
                          options={"force_static_compile": True})
 
 
@@ -554,14 +556,17 @@ def _compiled_hpu_delta_core():
 
 
 # GatedAttention - Full Attention with output gating
-def apply_partial_rope(xq, xk, freqs_cis, rotary_dim):
+def apply_partial_rope(xq, xk, freqs_cis, rotary_dim, native=False):
     """Apply RoPE to only the first rotary_dim dimensions."""
     xq_rot = xq[..., :rotary_dim]
     xq_pass = xq[..., rotary_dim:]
     xk_rot = xk[..., :rotary_dim]
     xk_pass = xk[..., rotary_dim:]
 
-    xq_rot, xk_rot = apply_rope(xq_rot, xk_rot, freqs_cis)
+    if native:
+        xq_rot, xk_rot = hpu_kv_attention.qwen_rope(xq_rot, xk_rot, rope_matrix(freqs_cis))
+    else:
+        xq_rot, xk_rot = apply_rope(xq_rot, xk_rot, freqs_cis)
 
     xq = torch.cat([xq_rot, xq_pass], dim=-1)
     xk = torch.cat([xk_rot, xk_pass], dim=-1)
@@ -636,7 +641,8 @@ class GatedAttention(nn.Module):
         xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply partial RoPE
-        xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim)
+        xq, xk = apply_partial_rope(xq, xk, freqs_cis, self.rotary_dim,
+                                  native=getattr(past_key_value, "native_rope", False))
 
         # KV cache
         present_key_value = past_key_value
@@ -735,6 +741,9 @@ class Qwen35Transformer(Llama2_):
         rotary_dim = int(self.config.head_dim * self.config.partial_rotary_factor)
         return precompute_freqs_cis(rotary_dim, position_ids, self.config.rope_theta,
                                     rope_dims=self.config.mrope_section, interleaved_mrope=True, device=device)
+
+
+_QWEN35_FREQS = Qwen35Transformer.compute_freqs_cis
 
 
 # Vision Encoder
@@ -1058,35 +1067,51 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         return self._generate_mtp(embeds, max_length, stop_tokens, mtp, sampling=sampling, position_ids=kwargs.get("position_ids"),
                                   repetition_penalty=repetition_penalty, presence_penalty=kwargs.get("presence_penalty", 0.0) or 0.0)
 
-    def _generation_forward(self, embeds, past_key_values):
-        original = self.model.forward
+    def _can_compile_generation(self, embeds, past_key_values):
         if (embeds.device.type != "hpu" or embeds.dtype != torch.bfloat16 or embeds.shape[0] != 1
                 or self.mtp is not None or type(self.model) is not Qwen35Transformer
                 or comfy.model_management.args.disable_comfy_compiler or comfy.model_management.in_training
                 or torch.is_grad_enabled() or comfy.model_management.comfy_kitchen_attention_enabled()
                 or "forward" in self.model.__dict__ or comfy.ops.has_forward_hooks(self.model)):
-            return original
+            return False
         if any(parameter.device != embeds.device or parameter.dtype != torch.bfloat16
                for parameter in self.model.parameters()):
-            return original
+            return False
         for layer, cache in zip(self.model.layers, past_key_values):
             if not layer.hpu_compile_mlp_residual:
-                return original
+                return False
             if layer.layer_type == "linear_attention":
                 if type(cache) is not LinearKV or not layer.linear_attn.hpu_compile_decode_core:
-                    return original
+                    return False
             elif type(cache) is not FixedKVCache or layer.self_attn.comfy_attention.method is not None:
-                return original
+                return False
         for module in self.model.modules():
             if isinstance(module, comfy.ops.CastWeightBiasOp):
                 if (module.weight_function or module.bias_function or hasattr(module, "_v")
                         or getattr(module, "weight_lowvram_function", None) is not None
                         or getattr(module, "bias_lowvram_function", None) is not None):
-                    return original
+                    return False
+        return True
+
+    def _generation_readback_size(self, embeds, past_key_values):
+        return 4 if self._can_compile_generation(embeds, past_key_values) else 1
+
+    def _generation_forward(self, embeds, past_key_values):
+        original = self.model.forward
+        if not self._can_compile_generation(embeds, past_key_values):
+            return original
         proxies = None
+        rotary_table = None
+        head = getattr(self.model, "lm_head", None)
+        native_fp8 = (getattr(head, "layout_type", None) == "HPUFP8E4M3Layout"
+                      and not getattr(head, "_full_precision_mm", False))
+        standard_rotary = native_fp8 and getattr(self.model.compute_freqs_cis, "__func__", None) is _QWEN35_FREQS
+        native_rotary = standard_rotary and int(self.model.config.head_dim * self.model.config.partial_rotary_factor) == 64
+        rotary_capacity = max((cache.key.shape[2] for cache in past_key_values
+                               if type(cache) is FixedKVCache), default=0) if standard_rotary else 0
 
         def forward(*values, **kwargs):
-            nonlocal proxies
+            nonlocal proxies, rotary_table
             current = kwargs.get("embeds")
             caches = kwargs.get("past_key_values")
             if current is None or current.shape[1] != 1 or not caches or caches[0].index == 0:
@@ -1099,14 +1124,26 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                         proxy = ImmediateLinearKV(cache.key, cache.value, 1, None, None,
                                                   cache.g_decay, cache.dt_bias, cache.norm_weight)
                     else:
+                        # Reuse the decoder graph when a prompt changes the KV capacity.
+                        torch._dynamo.mark_dynamic(cache.key, 2)
+                        torch._dynamo.mark_dynamic(cache.value, 2)
                         proxy = HPUSingleTokenKV(cache.key, cache.value, 1, cache.position, cache.seqlen, {"tree": None})
+                        proxy.native_rope = native_rotary
                     proxies.append(proxy)
             for cache in caches:
-                cache.prepare(1)
+                if not native_fp8 or type(cache) is not LinearKV:
+                    cache.prepare(1)
             positions = kwargs.get("position_ids")
-            if positions is None:
-                positions = torch.arange(caches[0].index, caches[0].index + 1, device=current.device).unsqueeze(0)
-            rotary = rope_matrix(self.model.compute_freqs_cis(positions, current.device))
+            if positions is None and rotary_capacity:
+                if rotary_table is None:
+                    positions = torch.arange(rotary_capacity, device=current.device).unsqueeze(0)
+                    rotary_table = rope_matrix(self.model.compute_freqs_cis(positions, current.device))
+                # Canonicalize singleton strides too; preserve_format retains the table capacity.
+                rotary = rotary_table[:, :, caches[0].index:caches[0].index + 1].clone(memory_format=torch.contiguous_format)
+            else:
+                if positions is None:
+                    positions = torch.arange(caches[0].index, caches[0].index + 1, device=current.device).unsqueeze(0)
+                rotary = rope_matrix(self.model.compute_freqs_cis(positions, current.device))
             hidden = _compiled_hpu_decode()(self.model, current.clone(), rotary, proxies)
             for cache in caches:
                 cache.advance(1)
