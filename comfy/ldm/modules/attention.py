@@ -14,6 +14,7 @@ import functools
 import comfy_kitchen
 
 from .diffusionmodules.util import AlphaBlender, timestep_embedding
+from . import hpu_attention
 from .sub_quadratic_attention import efficient_dot_product_attention
 
 from comfy import model_management
@@ -614,8 +615,16 @@ def _hpu_fp8_attention_av(q, k, v):
 
 
 def _hpu_fast_attention(q, k, v):
+    if (q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.shape[:2] == (1, 32) and q.shape[-1] == 128 and q.shape[-2] >= 4096
+            and k.shape == v.shape and k.shape[:2] == (1, 32)
+            and k.shape[-1] == 128 and k.shape[-2] >= 4096):
+        return hpu_attention.rmw_fast_attention(q, k, v, _hpu_fast_attention_part)
     k = (k.float() - k.float().mean(dim=-2, keepdim=True)).to(k.dtype)
-    q = q.contiguous()
+    return _hpu_fast_attention_part(q.contiguous(), k, v)
+
+
+def _hpu_fast_attention_part(q, k, v):
     split = k.shape[-2] // 128 * 128
     scale = q.shape[-1] ** -0.5
     if split == k.shape[-2]:
@@ -634,13 +643,40 @@ def _hpu_fast_attention(q, k, v):
     return torch.addcmul(first, last - first, share)
 
 
+@torch._dynamo.disable
+def _hpu_fast_attention_entry(q, k, v, b, heads, dim_head, skip_reshape, skip_output_reshape, enable_gqa):
+    if not skip_reshape:
+        q, k, v = _reshape_qkv_to_heads(q, k, v, b, heads, dim_head, enable_gqa, expand_kv=False)
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
+    out = _hpu_fast_attention(q, k, v)
+    if not skip_output_reshape:
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+    return out
+
+
 @wrap_attn
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-    if skip_reshape:
-        b, _, _, dim_head = q.shape
-    else:
-        b, _, dim_head = q.shape
-        dim_head //= heads
+    b = q.shape[0]
+    dim_head = q.shape[-1] if skip_reshape else q.shape[-1] // heads
+    sdpa_keys = ("scale", "enable_gqa")
+    sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
+    q_heads_ok = (q.shape[:2] == (1, 32) and q.shape[-1] == 128 and q.shape[-2] >= 4096) if skip_reshape else (
+        b == 1 and heads == 32 and q.shape[-1] == 4096 and q.shape[1] >= 4096
+    )
+    k_heads_ok = (k.shape == v.shape and k.shape[:2] == (1, 32) and k.shape[-1] == 128 and k.shape[-2] >= 4096) if skip_reshape else (
+        k.ndim == 3 and k.shape == v.shape and k.shape[0] == 1 and k.shape[-1] == 4096 and k.shape[1] >= 4096
+    )
+    if (SDP_BATCH_LIMIT >= b and kwargs.get("hpu_fast_attention", False)
+            and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q_heads_ok and k_heads_ok and mask is None and not sdpa_extra
+            and get_attn_precision(attn_precision, q.dtype) != torch.float32
+            and torch.compiler.is_compiling() and not args.disable_comfy_compiler
+            and not torch.is_grad_enabled() and not model_management.in_training):
+        return _hpu_fast_attention_entry(
+            q, k, v, b, heads, dim_head, skip_reshape, skip_output_reshape, kwargs.get("enable_gqa", False)
+        )
+
+    if not skip_reshape:
         q, k, v = _reshape_qkv_to_heads(q, k, v, b, heads, dim_head, kwargs.get("enable_gqa", False), expand_kv=False)
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
 
@@ -652,19 +688,7 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
 
-    sdpa_keys = ("scale", "enable_gqa")
-    sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
-
     if SDP_BATCH_LIMIT >= b:
-        hpu_fast_attention = (kwargs.get("hpu_fast_attention", False)
-                              and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
-                              and q.shape[:2] == (1, 32) and q.shape[-1] == 128 and q.shape[-2] >= 4096
-                              and k.shape == v.shape and k.shape[:2] == q.shape[:2]
-                              and k.shape[-1] == q.shape[-1] and k.shape[-2] >= 4096
-                              and mask is None and not sdpa_extra
-                              and get_attn_precision(attn_precision, q.dtype) != torch.float32
-                              and torch.compiler.is_compiling() and not args.disable_comfy_compiler
-                              and not torch.is_grad_enabled() and not model_management.in_training)
         fp8_attention = ((kwargs.get("transformer_options") or {}).get("fp8_attention", False)
                          and q.device.type == "hpu" and q.dtype == k.dtype == v.dtype == torch.bfloat16
                          and q.shape[:2] == (1, 1) and q.shape[-1] == 128 and q.shape[-2] >= 4096
@@ -672,9 +696,7 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
                          and get_attn_precision(attn_precision, q.dtype) != torch.float32
                          and torch.compiler.is_compiling() and not args.disable_comfy_compiler
                          and not torch.is_grad_enabled() and not model_management.in_training)
-        if hpu_fast_attention:
-            out = _hpu_fast_attention(q, k, v)
-        elif fp8_attention:
+        if fp8_attention:
             out = _hpu_fp8_attention_av(q, k, v)
         else:
             out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)

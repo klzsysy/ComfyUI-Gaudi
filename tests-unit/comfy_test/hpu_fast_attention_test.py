@@ -199,3 +199,25 @@ def test_qwen_reuses_attention_graphs_across_kv_boundaries(hpu, monkeypatch):
                 first = output
         torch.testing.assert_close(output, first, rtol=0, atol=0)
     assert len(graphs) <= 4
+
+
+@pytest.mark.parametrize('keys', [4096, 4225, 8607])
+def test_rmw_sram_residency_matches_split_sdpa_bitwise(hpu, keys):
+    generator = torch.Generator().manual_seed(509 + keys)
+    query = torch.randn(1, 4096, 32, 128, generator=generator, dtype=torch.bfloat16).transpose(1, 2)
+    key = torch.randn(1, keys, 32, 128, generator=generator, dtype=torch.bfloat16).transpose(1, 2)
+    value = torch.randn(1, keys, 32, 128, generator=generator, dtype=torch.bfloat16).transpose(1, 2)
+
+    def reference_part(q, k, v):
+        k = (k.float() - k.float().mean(dim=-2, keepdim=True)).to(k.dtype)
+        return attention._hpu_fast_attention_part(q.contiguous(), k, v)
+
+    compiled_ref = torch.compile(reference_part, backend='hpu_backend', dynamic=None,
+                                 options={'force_static_compile': True})
+    with torch.no_grad():
+        q, k, v = (tensor.to('hpu') for tensor in (query, key, value))
+        expected = compiled_ref(q, k, v).cpu()
+        actual = attention.hpu_attention.rmw_fast_attention(q, k, v, attention._hpu_fast_attention_part).cpu()
+    assert attention.hpu_attention._runtime().last_workspace <= 256
+    assert torch.equal(actual, expected)
+
