@@ -16,6 +16,7 @@ from comfy.ldm.flux.layers import EmbedND, timestep_embedding
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.lightricks.model import TimestepEmbedding
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+from comfy.ldm.qwen_image21 import hpu
 from comfy.ldm.wan.model_animate2 import PoseBranchCache, quantize_cache
 
 
@@ -171,6 +172,25 @@ class QwenImage21TransformerBlock(nn.Module):
         self.attn = Attention(dim, num_attention_heads, attention_head_dim, eps=eps, dtype=dtype, device=device, operations=operations)
         self.img_norm2 = operations.LayerNorm(dim, elementwise_affine=False, eps=eps, dtype=dtype, device=device)
         self.img_mlp = SwiGLUFeedForward(dim, dim * mlp_ratio, fused=fused_mlp, dtype=dtype, device=device, operations=operations)
+
+    def _forward_with_prefix(self, x, mod, pe, pk, pv, options, pending):
+        if (options.get("hpu_fast_attention")
+                and x.device.type == "hpu" and x.dtype == torch.bfloat16 and pe.dtype == torch.float32
+                and x.shape[0] == 1 and x.shape[1] >= 4096 and self.attn.heads == 32 and x.shape[2] == 4096
+                and pk.shape == pv.shape and pk.shape[2:] == (32, 128) and pk.dtype == pv.dtype == x.dtype
+                and self.attn.comfy_attention.method is None
+                and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+                and not comfy.model_management.in_training and not comfy.model_management.args.disable_comfy_compiler
+                and "optimized_attention_override" not in options and not options.get("patches")
+                and not options.get("patches_replace") and not comfy.ops.has_forward_hooks(self)):
+            result = hpu.prefix_attention(self, x, mod, pe, pk, pv, options, attention, pending)
+            if result is not None:
+                mid, normed, completed = result
+                output = _gated_residual(mid, self.img_mlp(normed), mod[3], 0)
+                completed.record()
+                pending.append(completed)
+                return output
+        return self(x, mod, pe, prefix_cached_attention(pk, pv, options), 0, options)
 
     def forward(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
         scale1, gate1, scale2, gate2, zero = mod
@@ -525,6 +545,7 @@ class QwenImage21Transformer2DModel(nn.Module):
         units = [(block, *(slot[i] for slot in cache.slots)) for i, block in enumerate(self.transformer_blocks)] if isinstance(cache, PrefixCache) else list(self.transformer_blocks)
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(units, x.device, transformer_options)
         comfy.model_prefetch.malloc_graph_begin(x.device)
+        pending = []
         for i, block in enumerate(self.transformer_blocks):
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, block, dtype, malloc_scope="block")
             transformer_options["block_index"] = i
@@ -545,6 +566,8 @@ class QwenImage21Transformer2DModel(nn.Module):
                         return {"img": block(args["img"], mod, args["pe"], attn_fn, prefix_len, args["transformer_options"])}
                     args = {"img": hidden_states, "vec": temb, "pe": pe, "mod": mod, "attn_fn": attn_fn, "prefix_len": prefix_len, "transformer_options": transformer_options}
                     hidden_states = blocks_replace[("single_block", i)](args, {"original_block": block_wrap})["img"]
+                elif cache is not None:
+                    hidden_states = block._forward_with_prefix(hidden_states, mod, pe, prefix_k, prefix_v, transformer_options, pending)
                 else:
                     hidden_states = block(hidden_states, mod, pe, attn_fn, prefix_len, transformer_options)
                 for p in patches.get("single_block", []):
