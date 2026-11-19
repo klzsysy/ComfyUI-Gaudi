@@ -18,6 +18,16 @@ def single_decode(q, key, value, length):
     return output.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
 
+def tree_decode_sdpa(q, key, value, prefix_len, tree_mask_bits):
+    seq = q.shape[2]
+    rel = torch.arange(key.shape[2], device=q.device).view(1, 1, 1, -1) - prefix_len.view(-1, 1, 1, 1)
+    tree_vis = ((tree_mask_bits.view(1, 1, seq, 1) >> rel.clamp(0, seq - 1)) & 1).bool()
+    visible = (rel < 0) | ((rel >= 0) & (rel < seq) & tree_vis)
+    mask = torch.zeros(visible.shape, device=q.device, dtype=q.dtype).masked_fill(~visible, float("-inf"))
+    output = FusedSDPA.apply(q, key, value, mask, 0.0, False, None, "fp32", False)
+    return output.transpose(1, 2).reshape(q.shape[0], seq, -1)
+
+
 def _decode(q, key, value, length):
     return comfy_kitchen.flash_attention_decode_gqa(q, key, value, length)
 
