@@ -168,11 +168,13 @@ def test_quantization_detection_reports_all_formats():
 @pytest.mark.parametrize('device,formats,native', [('hpu', ['float8_e4m3fn'], True), ('cpu', ['float8_e4m3fn'], False),
                                                    ('hpu', ['int8_tensorwise'], False), ('hpu', ['float8_e4m3fn','int8_tensorwise'], False)])
 def test_qwen_fp8_operation_selection(monkeypatch, device, formats, native):
+    from types import SimpleNamespace
     from comfy import sd1_clip
     from comfy.text_encoders import qwen35
     captured = {}
     def initialize(self, *args, **kwargs):
         captured.update(kwargs)
+        self.transformer = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(stop_tokens=[0])))
     monkeypatch.setattr(sd1_clip.SDClipModel, '__init__', initialize)
     options = {'load_device': torch.device(device), 'quantization_metadata': {'mixed_ops': True, 'formats': formats}}
     qwen35.Qwen35ClipModel(dtype=torch.bfloat16, model_options=options)

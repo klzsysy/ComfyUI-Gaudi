@@ -44,6 +44,97 @@ ComfyUI is the AI creation engine for visual professionals who demand control ov
 - The most sophisticated workflows can be exposed through a simple UI thanks to App Mode.
 - It integrates seamlessly into production pipelines with our API endpoints.
 
+## Intel Gaudi2 (HPU) Support
+
+This repository extends ComfyUI with native **Intel Gaudi2 HPU** support (validated on single-card Gaudi2 HL-225, Habana Gaudi Software 1.24.2, and Habana PyTorch in eager mode `PT_HPU_LAZY_MODE=0`).
+
+### 1. Driver & Host Environment Setup
+
+Before initializing ComfyUI, make sure the Gaudi2 driver, firmware, Synapse runtime, and Habana PyTorch base environment are installed and `hl-smi` reports the HPU as operational.
+
+- **Non-OEM / Single-Card Hosts (Recommended):** For non-OEM server environments (such as a single Gaudi2 OAM card on a PCIe adapter), we recommend using [gaudi2-single-card-driver](https://github.com/klzsysy/gaudi2-single-card-driver) to initialize the host environment, configure `iommu=pt`, install the patched Gaudi2 DKMS driver, and set up the Habana PyTorch venv under `/opt/gaudi-install/venv-*`.
+- **OEM Gaudi2 Servers:** Use Intel's standard Gaudi Software installer and pass your Habana PyTorch venv path via `--base-venv` or `GAUDI_BASE_VENV` if it is not under `/opt/gaudi-install/venv-*`.
+
+### 2. Verified & Optimized Models on Gaudi2
+
+While other standard ComfyUI models that rely on generic PyTorch/BF16 operators may also run on HPU, the following models and workflows have been verified end-to-end and optimized specifically for single-card Gaudi2:
+
+| Model / Family | Verified Precisions & Components | Key Gaudi2 Optimizations |
+| :--- | :--- | :--- |
+| **Qwen-Image-2.1 Turbo** | DiT: BF16 & native FP8 (`float8_e4m3fn`)<br>CLIP: Qwen3-VL 8B (BF16 / INT8 ConvRot / native FP8)<br>VAE: Qwen Image 2.1 VAE (BF16)<br>Prompt Enhancer: Qwen3.5 9B (BF16 / FP8 / FP8 + MTP) | Synapse RMW on-chip SRAM attention pipeline, aligned KV splits, fused FP8 DiT projections, HPU-safe VAE residual path, modular HPU MTP compilation, and 13 custom Gaudi2 TPC-C fused kernels with on-device batched speculative decoding |
+| **MOSS-Image** | **MOSS Image SFT** (BF16 DiT) & **Moody-Moss-Mix** (native FP8 DiT)<br>Text Encoder / `TextGenerate`: Qwen3.5 9B (BF16 / INT8 ConvRot / native FP8, with MTP)<br>VAE: Flux2 VAE | Native HPU FP8 Linear, fused FP8 block execution, long-sequence head-split & mixed FP8 attention, native norm/RoPE, static conditioning precomputation, and compiled GDN/KV decoding |
+| **Krea 2** | `krea2_turbo_int8_convrot` DiT<br>CLIP: Qwen3-VL 4B FP8 (`qwen3vl_4b_fp8_scaled`)<br>VAE: Qwen Image VAE | CPU-semantic 256-entry E4M3FN weight decoding table to avoid Gaudi2 E4M3 range overflow |
+| **Qwen3.5 9B & Qwen3-VL Text Generation** | BF16, INT8 ConvRot, and native FP8 E4M3 (with optional MTP speculative decoding) | Compiled GDN prefill/decode, dynamic KV capacity reuse, HPU-safe sampling & boolean penalty masks, and custom TPC-C kernels for FP8 MTP decoding |
+
+Optional portable conversion tools for creating Gaudi2-safe native FP8 checkpoints are included under `scripts/gaudi/`:
+
+```bash
+# Convert Qwen-Image-2.1 BF16 DiT to Gaudi2-safe FP8 E4M3
+.venv/bin/python -m scripts.gaudi.convert_qwen21_fp8 <src_bf16.safetensors> <dst_fp8.safetensors>
+
+# Convert Qwen3.5 9B (BF16 or INT8 ConvRot) to Gaudi2-safe FP8 E4M3 (optionally attaching/quantizing MTP)
+.venv/bin/python -m scripts.gaudi.convert_qwen35_fp8 --from-int8-convrot \
+  --attach-mtp <mtp_donor.safetensors> --quantize-mtp \
+  <src_pe.safetensors> <dst_pe_mtp_fp8.safetensors>
+```
+
+### 3. Initializing and Starting ComfyUI on Gaudi2
+
+Environment initialization and server startup are separated into dedicated root scripts:
+
+#### Initialize the Environment (first-time setup or after pulling kernel/dependency updates)
+
+```bash
+git clone https://github.com/klzsysy/ComfyUI-Gaudi.git
+cd ComfyUI-Gaudi
+
+# Automatically discovers /opt/gaudi-install/venv-*, creates .venv linked via gaudi-base.pth,
+# installs ComfyUI Python dependencies without shadowing vendor Habana PyTorch,
+# and compiles the Gaudi2 Qwen3.5 TPC-C kernel library into build/hpu/.
+./init-hpu.sh
+```
+
+Useful `./init-hpu.sh` options:
+- `--base-venv PATH` (or `GAUDI_BASE_VENV=PATH`): explicitly specify the Habana PyTorch base venv.
+- `--skip-deps`: skip `pip` installs (useful when only rebuilding TPC-C kernels).
+- `--rebuild-tpc`: force rebuild of `build/hpu/*.so`.
+- `--skip-tpc`: skip compiling the optional Qwen3.5 TPC-C kernels.
+- `--recreate-venv`: recreate `.venv` from scratch.
+
+Optional smoke check before starting the server:
+
+```bash
+PT_HPU_LAZY_MODE=0 GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so \
+  .venv/bin/python -m scripts.gaudi.smoke
+```
+
+#### Start and Stop ComfyUI
+
+- **Managed background service (default `127.0.0.1:8189`):**
+
+  ```bash
+  ./start-hpu.sh      # starts ComfyUI in the background and waits until /system_stats is ready
+  tail -f logs/hpu.log
+  ./stop-hpu.sh       # gracefully stops the running HPU server
+  ```
+
+  To customize the bind address or port, create a `.gaudi.env` file in the repository root:
+
+  ```bash
+  COMFYUI_LISTEN=0.0.0.0
+  COMFYUI_PORT=8189
+  ```
+
+- **Foreground launch (pass custom `main.py` flags directly):**
+
+  ```bash
+  bash scripts/gaudi/start.sh --listen 0.0.0.0 --port 8189
+  ```
+
+  `scripts/gaudi/start.sh` always runs `.venv/bin/python main.py` with `PT_HPU_LAZY_MODE=0`, appends `build/hpu/libcomfy_qwen35_tpc.so` to `GC_KERNEL_PATH`, and passes the HPU-compatible ComfyUI flags (`--disable-dynamic-vram --disable-pinned-memory --disable-async-offload --disable-xformers --use-pytorch-cross-attention --disable-all-custom-nodes`). Set `COMFY_HPU_DISABLE_QWEN35_TPC=1` to explicitly fall back to PyTorch kernels for Qwen3.5 MTP.
+
+---
+
 ## Get Started
 
 ### Local
@@ -53,7 +144,7 @@ ComfyUI is the AI creation engine for visual professionals who demand control ov
 - Available on Windows & macOS.
 
 #### [Manual Install](#manual-install-windows-linux)
-Supports all operating systems and GPU types (NVIDIA, AMD, Intel, Apple Silicon, Ascend).
+Supports all operating systems and GPU/accelerator types (NVIDIA, AMD, Intel, Intel Gaudi2 HPU, Apple Silicon, Ascend).
 
 ### Cloud
 
@@ -291,6 +382,10 @@ You can install ComfyUI in Apple Mac silicon (M1, M2, M3 or M4) with any recent 
 1. Launch ComfyUI by running `python main.py`
 
 > **Note**: Remember to add your models, VAE, LoRAs etc. to the corresponding Comfy folders, as discussed in [ComfyUI manual installation](#manual-install-windows-linux).
+
+#### Intel Gaudi2 HPUs (Linux)
+
+Native Intel Gaudi2 HPU support is included in this repository. For driver installation (including [gaudi2-single-card-driver](https://github.com/klzsysy/gaudi2-single-card-driver) for non-OEM / single-card hosts), verified models, and `./init-hpu.sh` / `./start-hpu.sh` setup instructions, see [Intel Gaudi2 (HPU) Support](#intel-gaudi2-hpu-support).
 
 #### Huawei Ascend NPUs
 
