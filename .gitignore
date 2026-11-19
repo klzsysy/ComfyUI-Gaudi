@@ -30,3 +30,4 @@ uv.lock
 /.run/
 /logs/
 /.gaudi.env
+/build/hpu/

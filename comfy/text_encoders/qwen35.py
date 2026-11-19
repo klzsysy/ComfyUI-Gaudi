@@ -1161,10 +1161,11 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         embeds = embeds.to(dt)
         if embeds.ndim == 2:
             embeds = embeds.unsqueeze(0)
-        cap = embeds.shape[1] + max_length + 7
+        headroom = 40 if device.type == "hpu" else 7
+        cap = embeds.shape[1] + max_length + headroom
         pkv = self.init_kv_cache(embeds.shape[0], cap, device, dt)
         # repair window: drafting ahead plus a near-full rollback; mtp_kv only stores generated tokens
-        mtp_cap = max_length + 7
+        mtp_cap = max_length + headroom
         mtp_kv = self.mtp.layers[0].self_attn.init_kv_cache(embeds.shape[0], mtp_cap, device, dt, {})
         head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
@@ -1244,6 +1245,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
                 kv.tracker["tree"] = tree
         hpu_runner = hpu_qwen35.build_mtp_runner(
             self, embeds, pkv, mtp_kv, tree, ftab, sampling, Qwen35Transformer, LinearKV, _QWEN35_FREQS,
+            pen_mask=pen_mask, adaptive=adaptive,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
         )
         topk_k = 7 if adaptive else tree.fanout
         ancestor_indices = hpu_qwen35.tree_ancestor_indices(tree, device) if hpu_runner is not None else None
@@ -1329,12 +1332,13 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             if measure_step:
                 record_timer(0)
             if hpu_runner is not None:
-                hpu_draft, hpu_verify, _, _ = hpu_runner
-                step_verify_tokens, tops = hpu_draft(nt_buf, h_buf, ftab, pos, depth, topk_k, gather_idx)
+                step_verify_tokens, tops = hpu_runner["run_draft"](nt_buf, h_buf, ftab, pos, depth, topk_k, gather_idx)
                 if measure_step:
                     record_timer(1)
-                x, toks = hpu_verify(step_verify_tokens, ftab, pos, tree, ancestor_indices, pen_mask, sampling, generator,
-                                     repetition_penalty=repetition_penalty, presence_penalty=presence_penalty)
+                x, toks = hpu_runner["run_verify"](
+                    step_verify_tokens, ftab, pos, tree, ancestor_indices, pen_mask, sampling, generator,
+                    repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
+                )
                 if measure_step:
                     record_timer(2)
                 packet = [toks[0], step_verify_tokens[0, 1:]]
@@ -1400,7 +1404,7 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             next_tok = toks[:, row:row + 1]
             on_chain = row == len(path) - 1
             if hpu_runner is not None:
-                hpu_runner[2](pos, path)
+                hpu_runner["record_commit"](pos, path)
                 if len(path) < tree.rows:
                     for kv in pkv:
                         if not isinstance(kv, LinearKV):
@@ -1428,42 +1432,87 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
             pos += len(commit)
             return commit, ranks, measure_step
 
+        def apply_step_result(commit, ranks, measured):
+            nonlocal steps, draft_ms, verify_ms, skip_timing, timing_budget, widths, depth, ancestor_indices, gather_idx
+            if adaptive:
+                steps += 1
+                for row_h in hits:
+                    for r in range(8):
+                        row_h[r] *= 0.984375
+                for level, rank in enumerate(ranks):
+                    hits[level][rank] += 1
+                # Do not learn graph capture cost as steady-state execution cost.
+                if steps > 8 and not skip_timing and measured:
+                    mix = 1.0 if draft_ms == 0.0 else 0.125
+                    draft_ms += mix * ((clocks[1] - clocks[0]) / len(widths) - draft_ms)
+                    verify_ms += mix * (clocks[2] - clocks[1] - verify_ms)
+                skip_timing = False
+                if steps % 32 == 0 and draft_ms > 0.0:
+                    best = best_widths(widths, hits, draft_ms, verify_ms)
+                    if best != widths:
+                        skip_timing = len(best) != len(widths)
+                        if skip_timing:
+                            timing_budget = 4
+                        widths = best
+                        tree.update(tree_spec(widths))
+                        depth = tree.chain
+                        if hpu_runner is not None:
+                            hpu_runner["sync_tree"](tree)
+                            ancestor_indices = hpu_qwen35.tree_ancestor_indices(tree, device)
+                            gather_idx = hpu_qwen35.tree_draft_gather_indices(tree, topk_k, device)
+            commit = list(commit[:max_length - len(ids)])
+            stop = next((i for i, t in enumerate(commit) if t in stop_tokens), None)
+            if stop is not None:
+                del commit[stop + 1:]
+            ids.extend(commit)
+            update_progress(len(commit))
+            return stop is not None or len(ids) >= max_length
+
         try:
-            while len(ids) < max_length and ids[-1] not in stop_tokens:
-                with (comfy.model_prefetch.malloc_graph_scope(device) if compile_allocations else contextlib.nullcontext()):
-                    commit, ranks, measured = step()
-                if adaptive:
-                    steps += 1
-                    for row in hits:
-                        for r in range(8):
-                            row[r] *= 0.984375
-                    for level, rank in enumerate(ranks):
-                        hits[level][rank] += 1
-                    # Do not learn graph capture cost as steady-state execution cost.
-                    if steps > 8 and not skip_timing and measured:
-                        mix = 1.0 if draft_ms == 0.0 else 0.125
-                        draft_ms += mix * ((clocks[1] - clocks[0]) / len(widths) - draft_ms)
-                        verify_ms += mix * (clocks[2] - clocks[1] - verify_ms)
-                    skip_timing = False
-                    if steps % 32 == 0 and draft_ms > 0.0:
-                        best = best_widths(widths, hits, draft_ms, verify_ms)
-                        if best != widths:
-                            skip_timing = len(best) != len(widths)
-                            if skip_timing:
-                                timing_budget = 4
-                            widths = best
-                            tree.update(tree_spec(widths))
-                            depth = tree.chain
-                            if hpu_runner is not None:
-                                hpu_runner[3](tree)
-                                ancestor_indices = hpu_qwen35.tree_ancestor_indices(tree, device)
-                                gather_idx = hpu_qwen35.tree_draft_gather_indices(tree, topk_k, device)
-                commit = list(commit[:max_length - len(ids)])
-                stop = next((i for i, t in enumerate(commit) if t in stop_tokens), None)
-                if stop is not None:
-                    del commit[stop + 1:]
-                ids.extend(commit)
-                update_progress(len(commit))
+            if hpu_runner is not None and hpu_runner["run_batch"] is not None:
+                batch_limit = hpu_runner["batch_steps"]
+                run_batch = hpu_runner["run_batch"]
+                while len(ids) < max_length and ids[-1] not in stop_tokens:
+                    measure_step = adaptive and (
+                        steps >= 8 and not skip_timing and (timing_budget > 0 or steps % 16 == 0)
+                    )
+                    if skip_timing:
+                        n_batch = 1
+                    else:
+                        n_batch = batch_limit
+                        if adaptive:
+                            n_batch = min(n_batch, 32 - (steps % 32))
+                            if steps < 8:
+                                n_batch = min(n_batch, 8 - steps)
+                            elif timing_budget == 0 and (steps % 16) != 0:
+                                n_batch = min(n_batch, 16 - (steps % 16))
+                        rem = max_length - len(ids)
+                        if rem <= depth + 1:
+                            n_batch = 1
+                        max_safe = max(1, (cap - pos - tree.rows) // (depth + 1))
+                        n_batch = max(1, min(n_batch, max_safe))
+                    batch_out = run_batch(
+                        n_batch, nt_buf, h_buf, tree, depth, topk_k, gather_idx, ancestor_indices, sampling,
+                        pos=pos, record_timer_fn=(record_timer if measure_step else None),
+                        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
+                    )
+                    if measure_step:
+                        if timers:
+                            timers[2].synchronize()
+                            clocks[0], clocks[1], clocks[2] = 0.0, timers[0].elapsed_time(timers[1]), timers[0].elapsed_time(timers[2])
+                        else:
+                            clocks[:] = [t * 1000 for t in clocks]
+                        if timing_budget > 0:
+                            timing_budget -= 1
+                    for bi, (commit, ranks) in enumerate(batch_out):
+                        pos += len(commit)
+                        if apply_step_result(commit, ranks, measure_step and bi == 0):
+                            break
+            else:
+                while len(ids) < max_length and ids[-1] not in stop_tokens:
+                    with (comfy.model_prefetch.malloc_graph_scope(device) if compile_allocations else contextlib.nullcontext()):
+                        commit, ranks, measured = step()
+                    apply_step_result(commit, ranks, measured)
         finally:
             console.close()
             comfy.model_prefetch.cleanup_prefetch_queues()

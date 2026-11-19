@@ -31,8 +31,19 @@ if [[ -f .run/hpu.pid ]]; then
 fi
 
 if [[ ! -x .venv/bin/python ]]; then
-    echo "Missing .venv/bin/python in $root" >&2
+    echo "Missing .venv/bin/python in $root. Run ./init-hpu.sh first." >&2
     exit 1
+fi
+
+if [[ "${COMFY_HPU_DISABLE_QWEN35_TPC:-0}" != "1" ]]; then
+    if [[ ! -f "$root/build/hpu/libcomfy_qwen35_tpc.so" || ! -f "$root/build/hpu/comfy_qwen35_tpc_bridge.so" ]]; then
+        echo "Missing Gaudi2 Qwen3.5 TPC kernels in $root/build/hpu. Run ./init-hpu.sh first (or set COMFY_HPU_DISABLE_QWEN35_TPC=1 to disable)." >&2
+        exit 1
+    fi
+    if [[ -f "$root/scripts/gaudi/build_qwen35_tpc.py" ]] && ! .venv/bin/python "$root/scripts/gaudi/build_qwen35_tpc.py" --check >/dev/null 2>&1; then
+        echo "Gaudi2 Qwen3.5 TPC kernels in $root/build/hpu are out of date. Run ./init-hpu.sh first (or set COMFY_HPU_DISABLE_QWEN35_TPC=1 to disable)." >&2
+        exit 1
+    fi
 fi
 
 .venv/bin/python - "$listen" "$port" <<'PY'
