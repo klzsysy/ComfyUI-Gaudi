@@ -1,0 +1,3 @@
+# Preserve vendor Habana PyTorch inherited via .venv/.../gaudi-base.pth;
+# uv does not read .pth files and would otherwise install upstream CUDA torch.
+exclude-dependencies = ["torch", "torchvision", "torchaudio", "triton", "xformers"]

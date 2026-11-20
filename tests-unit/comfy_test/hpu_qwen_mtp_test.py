@@ -576,6 +576,7 @@ def test_hpu_init_and_start_scripts_separation(tmp_path):
     shutil.copy2(repo_root / "init-hpu.sh", init_dst)
     shutil.copy2(repo_root / "start-hpu.sh", start_root_dst)
     shutil.copy2(repo_root / "scripts" / "gaudi" / "start.sh", start_dst)
+    shutil.copy2(repo_root / "uv.toml", work / "uv.toml")
     (work / "scripts" / "gaudi" / "build_qwen35_tpc.py").write_text("# stub\n")
     (work / "main.py").write_text("# stub\n")
 
@@ -601,6 +602,7 @@ def test_hpu_init_and_start_scripts_separation(tmp_path):
         "assert sys.argv[1] == 'main.py'\n"
         "Path(os.environ['STUB_OUT']).write_text(json.dumps({\n"
         "    'gc_kernel_path': os.environ.get('GC_KERNEL_PATH', ''),\n"
+        "    'uv_config_file': os.environ.get('UV_CONFIG_FILE', ''),\n"
         "    'lazy': os.environ.get('PT_HPU_LAZY_MODE', ''),\n"
         "    'args': sys.argv[1:],\n"
         "}))\n"
@@ -620,7 +622,14 @@ def test_hpu_init_and_start_scripts_separation(tmp_path):
     expected_lib = str(work.resolve() / "build" / "hpu" / "libcomfy_qwen35_tpc.so")
     assert data_dis["lazy"] == "0"
     assert expected_lib not in data_dis["gc_kernel_path"].split(":")
+    assert data_dis["uv_config_file"] == str(work.resolve() / "uv.toml")
+    assert "--enable-manager" in data_dis["args"]
+    assert "--disable-all-custom-nodes" not in data_dis["args"]
     assert data_dis["args"][-2:] == ["--port", "8199"]
+    uv_toml_text = (repo_root / "uv.toml").read_text()
+    for pkg in ("torch", "torchvision", "torchaudio", "triton", "xformers"):
+        assert f'"{pkg}"' in uv_toml_text
+    assert "manager_requirements.txt" in (repo_root / "init-hpu.sh").read_text()
 
     # 5. Stale build/hpu/*.so (--check fails) -> fails fast prompting init-hpu.sh
     (work / "build" / "hpu").mkdir(parents=True)

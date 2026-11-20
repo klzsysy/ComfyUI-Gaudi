@@ -25,6 +25,11 @@ if [[ "${COMFY_HPU_DISABLE_QWEN35_TPC:-0}" != "1" ]]; then
     fi
 fi
 
+uv_config="$(pwd -P)/uv.toml"
+if [[ -f "$uv_config" ]]; then
+    export UV_CONFIG_FILE="${UV_CONFIG_FILE:-$uv_config}"
+fi
+
 exec .venv/bin/python main.py --disable-dynamic-vram --disable-pinned-memory \
     --disable-async-offload --disable-xformers --use-pytorch-cross-attention \
-    --disable-all-custom-nodes --listen 127.0.0.1 --port 8189 "$@"
+    --enable-manager --listen 127.0.0.1 --port 8189 "$@"

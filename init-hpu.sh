@@ -177,6 +177,9 @@ PY
     if [[ -s "$templates_req" ]]; then
         .venv/bin/python -m pip install -r "$templates_req"
     fi
+    if [[ -f "$root/manager_requirements.txt" ]]; then
+        .venv/bin/python -m pip install -r "$root/manager_requirements.txt"
+    fi
 
     # Verify vendor Habana PyTorch is NOT shadowed by a local CUDA torch inside .venv.
     .venv/bin/python - "$base_site" <<'PY'
