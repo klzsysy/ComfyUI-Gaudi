@@ -260,6 +260,44 @@ static std::tuple<at::Tensor, at::Tensor> exec_dual_rms_cat(
     return {r[0], r[1]};
 }
 
+static habana::PartialOutputMetaDataVector meta_moss_situ_q(const at::Stack& s) {
+    auto y = s.at(0).toTensor();
+    return {{at::kFloat8_e4m3fn, {y.size(0), y.size(1) / 2}}, {at::kFloat, {y.size(0)}}};
+}
+static std::tuple<at::Tensor, at::Tensor> exec_moss_situ_q(const at::Tensor& y) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_moss_situ_quant");
+    auto r = op.execute({y});
+    return {r[0], r[1]};
+}
+
+static habana::PartialOutputMetaDataVector meta_moss_qkv_prep(const at::Stack& s) {
+    auto qkv = s.at(0).toTensor();
+    int64_t rows = qkv.size(0);
+    int64_t k_pad = ((rows + 127) / 128) * 128;
+    int64_t qk_dim = s.at(4).toInt() ? 128 : 192;
+    return {
+        {at::kBFloat16, {24, rows, qk_dim}},
+        {at::kBFloat16, {24, k_pad, qk_dim}},
+        {at::kFloat8_e4m3fn, {24, k_pad, 128}},
+        {at::kFloat, {24, 64}},
+    };
+}
+static std::shared_ptr<void> fill_moss_qkv_prep(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(MossQkvPrepParams);
+    params->aligned = static_cast<int32_t>(s.at(4).toInt());
+    params->eps = static_cast<float>(s.at(5).toDouble());
+    params->q_scale = static_cast<float>(s.at(6).toDouble());
+    params->k_scale = static_cast<float>(s.at(7).toDouble());
+    return params;
+}
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> exec_moss_qkv_prep(
+    const at::Tensor& qkv, const at::Tensor& qn_w, const at::Tensor& kn_w, const at::Tensor& pe_cs,
+    int64_t aligned, double eps, double q_scale, double k_scale) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_moss_qkv_prep");
+    auto r = op.execute({qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale});
+    return {r[0], r[1], r[2], r[3]};
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
     lib.def("comfy_qwen35_topk_s1(Tensor logits, Tensor pen_mask, Tensor anc_toks, int has_pen, float pres_pen, float rep_pen) -> Tensor");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen35_topk_s1", "comfy_topk_s1_bmax", meta_topk_s1, fill_topk_s1);
@@ -299,6 +337,12 @@ TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
 
     lib.def("comfy_qwen35_dual_rmsnorm_cat_quant(Tensor emb, Tensor hid, Tensor w_emb, Tensor w_hid, int add_one, float eps) -> (Tensor, Tensor)");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen35_dual_rmsnorm_cat_quant", "comfy_dual_rmsnorm_cat_quant_fp8", meta_dual_rms_cat, fill_dual_rms_cat);
+
+    lib.def("comfy_moss_situ_quant(Tensor y) -> (Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_situ_quant", "comfy_moss_situ_quant_fp8", meta_moss_situ_q, nullptr);
+
+    lib.def("comfy_moss_qkv_prep(Tensor qkv, Tensor qn_w, Tensor kn_w, Tensor pe_cs, int aligned, float eps, float q_scale, float k_scale) -> (Tensor, Tensor, Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_qkv_prep", "comfy_moss_qkv_prep_fp8", meta_moss_qkv_prep, fill_moss_qkv_prep);
 }
 
 TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
@@ -315,4 +359,6 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
     lib.impl("comfy_qwen35_qk_norm_rope", exec_qk_norm_rope);
     lib.impl("comfy_qwen35_sample_tree_accept", exec_sample_accept);
     lib.impl("comfy_qwen35_dual_rmsnorm_cat_quant", exec_dual_rms_cat);
+    lib.impl("comfy_moss_situ_quant", exec_moss_situ_q);
+    lib.impl("comfy_moss_qkv_prep", exec_moss_qkv_prep);
 }

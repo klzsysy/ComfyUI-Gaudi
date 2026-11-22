@@ -12,7 +12,15 @@ import comfy.quant_ops
 import comfy.utils
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+from comfy.ldm.modules import hpu_attention
 from . import hpu
+
+_hpu_tpc = None
+if hasattr(torch, "hpu"):
+    try:
+        from comfy.text_encoders import hpu_qwen35_tpc as _hpu_tpc
+    except Exception:
+        _hpu_tpc = None
 
 
 def situ(hidden, gate):
@@ -105,6 +113,20 @@ def _attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_
             and not torch.is_grad_enabled() and not comfy.model_management.in_training
             and mask is None and ref_kv is None and kv_out is None and comfy_attention.method is None
             and "optimized_attention_override" not in transformer_options):
+        if transformer_options.get("fp8_attention", False) and hpu_attention.rmw_fp8_supported(N):
+            qh = q.view(1, N, heads, 128).transpose(1, 2)
+            kh = k.view(1, N, heads, 128).transpose(1, 2)
+            vh = v.view(1, N, heads, 128).transpose(1, 2)
+            out = hpu_attention.rmw_fp8_attention(
+                qh, kh, vh,
+                lambda fq, fk, fv: _attention_heads(
+                    fq.transpose(1, 2).reshape(1, N, 3072),
+                    fk.transpose(1, 2).reshape(1, N, 3072),
+                    fv.transpose(1, 2).reshape(1, N, 3072),
+                    heads, comfy_attention, transformer_options,
+                ).view(1, N, heads, 128).transpose(1, 2),
+            )
+            return out.transpose(1, 2).reshape(1, N, 3072)
         return _attention_heads(q, k, v, heads, comfy_attention, transformer_options)
     q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
     return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=comfy_attention)
@@ -202,10 +224,51 @@ class Block(nn.Module):
         x = residual(x, out, mod, 2, None)
         return residual(x, self._forward_ffn_modulated(x, mod), mod, 5, None)
 
+    def _forward_hpu_pre_attn(self, x, mod, pe_cs, aligned):
+        y = modulate(x, self.norm1, mod, 0, None)
+        qkv = self.proj["qkv"](y)
+        del y
+        q_scale_w, _, q_stream = comfy.ops.cast_bias_weight(self.q_norm, qkv, offloadable=True)
+        k_scale_w, _, k_stream = comfy.ops.cast_bias_weight(self.k_norm, qkv, offloadable=True)
+        scale = 128.0 ** -0.25
+        qh, kh, vh, out_scales = _hpu_tpc.moss_qkv_prep(
+            qkv.reshape(-1, 9216).contiguous(),
+            q_scale_w.contiguous(),
+            k_scale_w.contiguous(),
+            pe_cs,
+            aligned,
+            self.q_norm.eps,
+            scale,
+            scale,
+        )
+        comfy.ops.uncast_bias_weight(self.q_norm, q_scale_w, None, q_stream)
+        comfy.ops.uncast_bias_weight(self.k_norm, k_scale_w, None, k_stream)
+        return qh, kh, vh, out_scales
+
+    def _forward_hpu_post_attn_ffn(self, x, attn_out, out_scales, mod):
+        scaled = attn_out * out_scales[:, 0].view(24, 1, 1).to(attn_out.dtype)
+        out = self.proj["o"](scaled.transpose(0, 1).reshape(1, -1, 3072))
+        x = residual(x, out, mod, 2, None)
+        return residual(x, self._forward_ffn_modulated(x, mod), mod, 5, None)
+
     def forward(self, x, mod, pe, transformer_options={}, ref=None, ref_kv=None, kv_out=None, mask=None):
         attention_forward, ffn_forward = Block._forward_attention, Block._forward_ffn
         if x.device.type == "hpu" and x.dtype == torch.bfloat16 and not comfy.model_management.args.disable_comfy_compiler and not comfy.model_management.in_training and "optimized_attention_override" not in transformer_options and not comfy.ops.has_forward_hooks(self):
             if self.hpu_fp8 and not torch.is_grad_enabled() and ref is None and ref_kv is None and kv_out is None and mask is None:
+                pe_cs = transformer_options.get("_moss_hpu_pe_cs")
+                if (self.fused_qkv and self.num_heads == 24 and x.shape[0] == 1 and x.shape[1] >= 4096
+                        and x.shape[-1] == 3072 and self.comfy_attention.method is None
+                        and self.q_norm.eps == self.k_norm.eps
+                        and transformer_options.get("fp8_attention", False)
+                        and _hpu_tpc is not None and _hpu_tpc.available
+                        and pe.dtype == torch.float32 and pe_cs is not None
+                        and pe_cs.device == x.device and pe_cs.dtype == torch.float32
+                        and pe_cs.shape == (x.shape[1], 128)
+                        and hpu_attention.rmw_fp8_supported(x.shape[1])):
+                    aligned = 1 if (x.shape[1] % 128) == 0 else 0
+                    qh, kh, vh, out_scales = _compiled_block_pre_attn()(self, x, mod, pe_cs, aligned)
+                    attn_out = hpu_attention.rmw_fp8_attention_prepared(qh, kh, vh)
+                    return _compiled_block_post_attn_ffn()(self, x, attn_out, out_scales, mod)
                 return _compiled_block_forward()(self, x, mod, pe, transformer_options)
             attention_forward, ffn_forward = _compiled_block_ops()
         # Keep modulation and residual rounding outside the compiled projections.
@@ -219,6 +282,16 @@ class Block(nn.Module):
 @lru_cache(maxsize=1)
 def _compiled_block_forward():
     return torch.compile(Block._forward_fused, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+@lru_cache(maxsize=1)
+def _compiled_block_pre_attn():
+    return torch.compile(Block._forward_hpu_pre_attn, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+@lru_cache(maxsize=1)
+def _compiled_block_post_attn_ffn():
+    return torch.compile(Block._forward_hpu_post_attn_ffn, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
 
 
 @lru_cache(maxsize=1)
@@ -289,9 +362,13 @@ class MOSSImage(nn.Module):
         pe = self.rope(height, width, context.shape[1], context.device, transformer_options)
         text_mask = None if context_attention_bias is None else context_attention_bias[:, None, None]
         txt = self.text_embedder(context, pe[:, height * width:], transformer_options, text_mask)
-        return txt, {"pe": pe, "shape": (height, width), "text_len": context.shape[1],
-                     "blockwise": pe.device.type == "hpu" and pe.dtype == torch.float32 and hpu.blockwise_coefficients(pe),
+        blockwise = pe.device.type == "hpu" and pe.dtype == torch.float32 and hpu.blockwise_coefficients(pe)
+        rope_info = {"pe": pe, "shape": (height, width), "text_len": context.shape[1],
+                     "blockwise": blockwise,
                      "rope_options": transformer_options.get("rope_options", {}).copy()}
+        if blockwise:
+            rope_info["pe_cs"] = hpu.pack_blockwise_pe_cs(pe)
+        return txt, rope_info
 
     def forward(self, x, timestep, context, transformer_options={}, **kwargs):
         return comfy.patcher_extension.WrapperExecutor.new_class_executor(
@@ -351,6 +428,11 @@ class MOSSImage(nn.Module):
         del txt, refs
         if device.type == "hpu":
             transformer_options["_moss_hpu_blockwise_rope"] = blockwise_rope
+            if blockwise_rope:
+                pe_cs = prepared_rope.get("pe_cs") if use_prepared else None
+                if pe_cs is None:
+                    pe_cs = hpu.pack_blockwise_pe_cs(pe)
+                transformer_options["_moss_hpu_pe_cs"] = pe_cs
 
         blocks_replace = transformer_options.get("patches_replace", {}).get("dit", {})
         transformer_options["total_blocks"] = len(self.layers)

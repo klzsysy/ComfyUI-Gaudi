@@ -31,6 +31,8 @@ KERNELS = (
     ("qk_norm_rope", "qk_norm_rope.c"),
     ("sample_accept", "sample_tree_accept.c"),
     ("dual_rms_cat", "dual_rmsnorm_cat_quant.c"),
+    ("moss_situ_q", "moss_situ_quant.c"),
+    ("moss_qkv_prep", "moss_qkv_prep.c"),
 )
 
 EXTRA_SOURCES = ("params.h", "glue.cpp", "bridge.cpp")

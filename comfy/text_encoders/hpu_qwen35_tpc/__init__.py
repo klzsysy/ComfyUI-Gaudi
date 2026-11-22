@@ -165,6 +165,25 @@ if available:
             emb.new_empty((emb.shape[0], 1), dtype=torch.float32),
         )
 
+    @torch.library.register_fake("custom_op::comfy_moss_situ_quant")
+    def _fake_moss_situ_quant(y):
+        return (
+            y.new_empty((y.shape[0], y.shape[1] // 2), dtype=torch.float8_e4m3fn),
+            y.new_empty((y.shape[0],), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_moss_qkv_prep")
+    def _fake_moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale):
+        rows = qkv.shape[0]
+        k_pad = ((rows + 127) // 128) * 128
+        qk_dim = 128 if aligned else 192
+        return (
+            qkv.new_empty((24, rows, qk_dim), dtype=torch.bfloat16),
+            qkv.new_empty((24, k_pad, qk_dim), dtype=torch.bfloat16),
+            qkv.new_empty((24, k_pad, 128), dtype=torch.float8_e4m3fn),
+            qkv.new_empty((24, 64), dtype=torch.float32),
+        )
+
 
 def topk(logits, pen_mask, anc_toks, k, has_pen, pres_pen, rep_pen):
     bmax = torch.ops.custom_op.comfy_qwen35_topk_s1(logits, pen_mask, anc_toks, has_pen, pres_pen, rep_pen)
@@ -215,3 +234,11 @@ def sample_tree_accept(top_vals, top_idx, verify_tokens, tops, rand_u, state_in,
 
 def dual_rmsnorm_cat_quant(emb, hid, w_emb, w_hid, add_one, eps):
     return torch.ops.custom_op.comfy_qwen35_dual_rmsnorm_cat_quant(emb, hid, w_emb, w_hid, add_one, eps)
+
+
+def moss_situ_quant(y):
+    return torch.ops.custom_op.comfy_moss_situ_quant(y)
+
+
+def moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale):
+    return torch.ops.custom_op.comfy_moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale)

@@ -254,3 +254,67 @@ def test_moss_fp8_attention_options_preserve_explicit_choice(monkeypatch, enable
     with torch.no_grad():
         model(torch.randn(1, 128, 2, 2), torch.ones(1), torch.randn(1, 3, 128), transformer_options=options)
     assert observed == [enabled] and options == before
+
+
+@pytest.mark.parametrize("length", [4096, 4403, 8506])
+def test_rmw_fp8_attention_workspace_and_accuracy(hpu_compiler, length):
+    from comfy.ldm.modules import hpu_attention
+
+    torch.manual_seed(91 + length)
+    q, k, v = torch.randn(1, 24, length, 3 * 128, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
+    with torch.no_grad():
+        actual = hpu_attention.rmw_fp8_attention(
+            q, k, v, lambda *a: pytest.fail("RMW FP8 attention should not fall back")
+        )
+        assert hpu_attention._fp8_runtime().last_workspace <= 256
+        assert actual.shape == (1, 24, length, 128) and actual.dtype == torch.bfloat16
+        assert torch.isfinite(actual).all()
+        # Compare head 0 against exact single-head FP8 AV reference and BF16 SDPA.
+        ref_fp8 = torch.compile(attention_module._hpu_fp8_attention_av, backend="hpu_backend", dynamic=False)(
+            q[:, :1].contiguous(), k[:, :1].contiguous(), v[:, :1].contiguous()
+        )
+        ref_sdpa = torch.nn.functional.scaled_dot_product_attention(q[:, :1], k[:, :1], v[:, :1])
+        rel_fp8 = (actual[:, :1].float().cpu() - ref_fp8.float().cpu()).norm() / ref_fp8.float().cpu().norm()
+        rel_sdpa = (actual[:, :1].float().cpu() - ref_sdpa.float().cpu()).norm() / ref_sdpa.float().cpu().norm()
+        # Long diffuse random sequences sit near FP8 probability subnormals (cf. 0.08 tolerance above).
+        assert rel_fp8 < (0.05 if length >= 8192 else 0.02)
+        assert rel_sdpa < 0.08
+        # Verify repeated invocation with different inputs updates outputs cleanly.
+        v2 = -v
+        actual2 = hpu_attention.rmw_fp8_attention(
+            q, k, v2, lambda *a: pytest.fail("RMW FP8 attention should not fall back")
+        )
+        torch.testing.assert_close(actual2.cpu(), (-actual).cpu(), atol=1e-2, rtol=1e-2)
+
+
+def test_moss_attention_rmw_fp8_dispatch_and_disable(hpu_compiler, monkeypatch):
+    from comfy.ldm.modules import hpu_attention
+
+    torch.manual_seed(97)
+    length = 4096
+    q, k, v = torch.randn(1, length, 3 * 3072, dtype=torch.bfloat16).to("hpu").chunk(3, dim=-1)
+    norms = [comfy.ops.manual_cast.RMSNorm(128, eps=1e-6, dtype=torch.bfloat16, device="hpu") for _ in range(2)]
+    for norm in norms:
+        norm.weight.data.fill_(1.0)
+    angle = torch.randn(1, length, 1, 64)
+    pe = torch.stack((angle.cos(), -angle.sin(), angle.sin(), angle.cos()), dim=-1).reshape(1, length, 1, 64, 2, 2).to("hpu")
+    preferred = moss.ComfyAttention()
+
+    calls = []
+    orig_rmw = hpu_attention.rmw_fp8_attention
+
+    def spy_rmw(*args, **kwargs):
+        calls.append("rmw")
+        return orig_rmw(*args, **kwargs)
+
+    monkeypatch.setattr(hpu_attention, "rmw_fp8_attention", spy_rmw)
+    with torch.no_grad():
+        # fp8_attention=False must bypass RMW FP8 attention.
+        out_bf16 = moss.attention(q, k, v, norms[0], norms[1], pe, 24, preferred, {"fp8_attention": False})
+        assert calls == [] and torch.isfinite(out_bf16).all()
+        # fp8_attention=True must take RMW FP8 attention instead of serialized _attention_heads.
+        monkeypatch.setattr(moss, "_attention_heads", lambda *a, **kw: pytest.fail("_attention_heads should be bypassed"))
+        out_fp8 = moss.attention(q, k, v, norms[0], norms[1], pe, 24, preferred, {"fp8_attention": True})
+        assert calls == ["rmw"] and torch.isfinite(out_fp8).all()
+        rel = (out_fp8.float().cpu() - out_bf16.float().cpu()).norm() / out_bf16.float().cpu().norm()
+        assert rel < 0.08

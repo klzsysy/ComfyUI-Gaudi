@@ -12,6 +12,11 @@ def blockwise_coefficients(pe):
     return bool(((pe[..., 0, 0] == pe[..., 1, 1]) & (pe[..., 0, 1] == -pe[..., 1, 0])).all().item())
 
 
+def pack_blockwise_pe_cs(pe):
+    # Pack [1, N, 1, 64, 2, 2] blockwise FP32 RoPE table into [N, 128] FP32 [cos64, sin64].
+    return torch.cat((pe[0, :, 0, :, 0, 0], pe[0, :, 0, :, 1, 0]), dim=-1).float().contiguous()
+
+
 def _rope(x, pe, blockwise=False):
     if blockwise:
         cos = torch.cat((pe[..., 0, 0], pe[..., 1, 1]), dim=-1)

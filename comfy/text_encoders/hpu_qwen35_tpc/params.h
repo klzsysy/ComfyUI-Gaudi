@@ -62,3 +62,10 @@ struct DualRmsCatQuantParams {
     int32_t add_one;
     float eps;
 };
+
+struct MossQkvPrepParams {
+    int32_t aligned;
+    float eps;
+    float q_scale;
+    float k_scale;
+};
