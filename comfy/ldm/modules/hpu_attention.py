@@ -1,5 +1,5 @@
 """On-chip RMW SRAM attention pipeline for Gaudi2 HPU."""
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import ctypes as C
 from functools import lru_cache
 import hashlib
@@ -451,6 +451,28 @@ extern "C" int launch_rmw_plan(void* handle, void* stream, const uint64_t* base_
 extern "C" void destroy_rmw_plan(void* handle) {
     delete static_cast<RMWPlan*>(handle);
 }
+
+extern "C" void* create_rmw_event(uint32_t device_id) {
+    synEventHandle ev = nullptr;
+    synStatus st = synEventCreate(&ev, device_id, 0);
+    return (st == synSuccess) ? static_cast<void*>(ev) : nullptr;
+}
+
+extern "C" int record_rmw_event(void* ev, void* stream) {
+    return static_cast<int>(synEventRecord(static_cast<synEventHandle>(ev), static_cast<synStreamHandle>(stream)));
+}
+
+extern "C" int query_rmw_event(void* ev) {
+    return static_cast<int>(synEventQuery(static_cast<synEventHandle>(ev)));
+}
+
+extern "C" int sync_rmw_event(void* ev) {
+    return static_cast<int>(synEventSynchronize(static_cast<synEventHandle>(ev)));
+}
+
+extern "C" void destroy_rmw_event(void* ev) {
+    if (ev) synEventDestroy(static_cast<synEventHandle>(ev));
+}
 """
 
 
@@ -546,7 +568,64 @@ def _load_rmw_library():
     lib.launch_rmw_plan.restype = C.c_int
     lib.destroy_rmw_plan.argtypes = [C.c_void_p]
     lib.destroy_rmw_plan.restype = None
+    lib.create_rmw_event.argtypes = [C.c_uint32]
+    lib.create_rmw_event.restype = C.c_void_p
+    lib.record_rmw_event.argtypes = [C.c_void_p, C.c_void_p]
+    lib.record_rmw_event.restype = C.c_int
+    lib.query_rmw_event.argtypes = [C.c_void_p]
+    lib.query_rmw_event.restype = C.c_int
+    lib.sync_rmw_event.argtypes = [C.c_void_p]
+    lib.sync_rmw_event.restype = C.c_int
+    lib.destroy_rmw_event.argtypes = [C.c_void_p]
+    lib.destroy_rmw_event.restype = None
     return lib
+
+
+class _InflightTracker:
+    """Pins HPU tensors passed to raw synLaunch until their Synapse completion event fires."""
+
+    def __init__(self, lib, max_inflight: int = 2):
+        self.lib = lib
+        self.max_inflight = max(1, int(max_inflight))
+        self.inflight: deque[tuple[int, int, tuple]] = deque()
+        self.free_events: dict[int, list[int]] = {}
+
+    def reclaim(self):
+        while self.inflight:
+            ev, dev_id, _ = self.inflight[0]
+            if self.lib.query_rmw_event(ev) != 0:
+                break
+            self.inflight.popleft()
+            self.free_events.setdefault(dev_id, []).append(ev)
+
+    def wait_for_slot(self):
+        self.reclaim()
+        while len(self.inflight) >= self.max_inflight:
+            ev, dev_id, _ = self.inflight.popleft()
+            st = self.lib.sync_rmw_event(ev)
+            self.free_events.setdefault(dev_id, []).append(ev)
+            if st != 0:
+                raise RuntimeError(f"sync_rmw_event failed with synStatus={st}")
+
+    def track(self, stream: int, device_id: int, tensors: tuple):
+        pool = self.free_events.get(device_id)
+        if pool:
+            ev = pool.pop()
+        else:
+            ev = self.lib.create_rmw_event(device_id)
+            if not ev:
+                raise RuntimeError(f"create_rmw_event failed on device {device_id}")
+        st = self.lib.record_rmw_event(ev, stream)
+        if st != 0:
+            self.lib.destroy_rmw_event(ev)
+            raise RuntimeError(f"record_rmw_event failed with synStatus={st}")
+        self.inflight.append((ev, device_id, tensors))
+
+    def drain(self):
+        while self.inflight:
+            ev, dev_id, _ = self.inflight.popleft()
+            self.lib.sync_rmw_event(ev)
+            self.free_events.setdefault(dev_id, []).append(ev)
 
 
 class _RMWAttentionRuntime:
@@ -564,6 +643,7 @@ class _RMWAttentionRuntime:
         self.plans: OrderedDict[tuple[int, int, int], int] = OrderedDict()
         self.ws: torch.Tensor | None = None
         self.last_workspace: int = 0
+        self._inflight = _InflightTracker(self.lib, max_inflight=2)
 
     def _address(self, tensor: torch.Tensor) -> int:
         return self._data_ptr(tensor) + tensor.storage_offset() * tensor.element_size()
@@ -589,6 +669,7 @@ class _RMWAttentionRuntime:
             return None
         while len(self.plans) >= self.max_plans:
             _, evicted = self.plans.popitem(last=False)
+            self._inflight.drain()
             torch.hpu.synchronize()
             self.lib.destroy_rmw_plan(evicted)
         self.plans[key] = plan
@@ -615,24 +696,30 @@ class _RMWAttentionRuntime:
         self.last_workspace = ws_bytes
         ws = self.get_workspace(ws_bytes, q.device)
 
+        dev_id = int(q.device.index or 0)
         if not retained:
             qh, kh, vh = prep_aligned(q, k, v)
+            self._inflight.wait_for_slot()
             out = torch.empty_like(qh)
             self._debug_eager_C.join_pending_pipeline_threads()
+            stream = self._compute_stream()
             ptrs = (C.c_uint64 * 6)(
                 self._address(qh), self._address(kh), self._address(vh), self._address(out), 0, 0
             )
-            st = self.lib.launch_rmw_plan(plan, self._compute_stream(), ptrs, self._address(ws), 32)
+            st = self.lib.launch_rmw_plan(plan, stream, ptrs, self._address(ws), 32)
             if st != 0:
                 raise RuntimeError(f"launch_rmw_plan aligned failed with synStatus={st}")
+            self._inflight.track(stream, dev_id, (qh, kh, vh, out, ws))
             return transpose_nhd(out)
 
         qh, k1, v1, last, max2, inv2 = prep_split(q, k, v)
+        self._inflight.wait_for_slot()
         first = torch.empty_like(qh)
         stat_queries = ((queries + 63) // 64) * 64
         max1 = torch.empty(1, 32, stat_queries, 1, device=qh.device, dtype=qh.dtype)
         inv1 = torch.empty_like(max1)
         self._debug_eager_C.join_pending_pipeline_threads()
+        stream = self._compute_stream()
         ptrs = (C.c_uint64 * 6)(
             self._address(qh),
             self._address(k1),
@@ -641,9 +728,10 @@ class _RMWAttentionRuntime:
             self._address(max1),
             self._address(inv1),
         )
-        st = self.lib.launch_rmw_plan(plan, self._compute_stream(), ptrs, self._address(ws), 32)
+        st = self.lib.launch_rmw_plan(plan, stream, ptrs, self._address(ws), 32)
         if st != 0:
             raise RuntimeError(f"launch_rmw_plan split failed with synStatus={st}")
+        self._inflight.track(stream, dev_id, (qh, k1, v1, first, max1, inv1, ws))
         return merge_tail(first, max1[:, :, :queries], inv1[:, :, :queries], last, max2, inv2)
 
 
@@ -744,6 +832,7 @@ class _RMWFP8AttentionRuntime:
         self.sin: torch.Tensor | None = None
         self.sout: torch.Tensor | None = None
         self.last_workspace: int = 0
+        self._inflight = _InflightTracker(self.lib, max_inflight=2)
 
     def _address(self, tensor: torch.Tensor) -> int:
         return self._data_ptr(tensor) + tensor.storage_offset() * tensor.element_size()
@@ -772,6 +861,7 @@ class _RMWFP8AttentionRuntime:
             return None
         while len(self.plans) >= self.max_plans:
             _, evicted = self.plans.popitem(last=False)
+            self._inflight.drain()
             torch.hpu.synchronize()
             self.lib.destroy_rmw_plan(evicted)
         self.plans[key] = plan
@@ -795,8 +885,10 @@ class _RMWFP8AttentionRuntime:
         ws_bytes = int(self.lib.rmw_plan_workspace_bytes(plan))
         self.last_workspace = ws_bytes
         self._ensure_buffers(ws_bytes, qh.device)
+        self._inflight.wait_for_slot()
         out = torch.empty((heads, queries, 128), dtype=torch.bfloat16, device=qh.device)
         self._debug_eager_C.join_pending_pipeline_threads()
+        stream = self._compute_stream()
         ptrs = (C.c_uint64 * 6)(
             self._address(qh),
             self._address(kh),
@@ -805,9 +897,10 @@ class _RMWFP8AttentionRuntime:
             self._address(self.sin),
             self._address(self.sout),
         )
-        st = self.lib.launch_rmw_plan(plan, self._compute_stream(), ptrs, self._address(self.ws), heads)
+        st = self.lib.launch_rmw_plan(plan, stream, ptrs, self._address(self.ws), heads)
         if st != 0:
             raise RuntimeError(f"launch_rmw_fp8_plan failed with synStatus={st}")
+        self._inflight.track(stream, int(qh.device.index or 0), (qh, kh, vh_fp8, out, self.ws, self.sin, self.sout))
         return out
 
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fallback_fn) -> torch.Tensor:
@@ -842,3 +935,10 @@ def rmw_fp8_attention_prepared(qh: torch.Tensor, kh: torch.Tensor, vh_fp8: torch
 @torch._dynamo.disable
 def rmw_fp8_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fallback_fn) -> torch.Tensor:
     return _fp8_runtime().execute(q, k, v, fallback_fn)
+
+
+def release_inflight():
+    if _runtime.cache_info().currsize:
+        _runtime()._inflight.drain()
+    if _fp8_runtime.cache_info().currsize:
+        _fp8_runtime()._inflight.drain()

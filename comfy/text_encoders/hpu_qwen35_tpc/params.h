@@ -69,3 +69,7 @@ struct MossQkvPrepParams {
     float q_scale;
     float k_scale;
 };
+
+struct MossResAdalnParams {
+    float eps;
+};

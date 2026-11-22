@@ -184,6 +184,22 @@ if available:
             qkv.new_empty((24, 64), dtype=torch.float32),
         )
 
+    @torch.library.register_fake("custom_op::comfy_moss_res_adaln_quant")
+    def _fake_moss_res_adaln_quant(x, res, gate, eff_scale, shift, eps):
+        return (
+            x.new_empty(x.shape, dtype=torch.bfloat16),
+            x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+            x.new_empty((x.shape[0],), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_moss_hnd_scale_quant")
+    def _fake_moss_hnd_scale_quant(attn, scales):
+        rows = attn.shape[1]
+        return (
+            attn.new_empty((rows, 3072), dtype=torch.float8_e4m3fn),
+            attn.new_empty((rows,), dtype=torch.float32),
+        )
+
 
 def topk(logits, pen_mask, anc_toks, k, has_pen, pres_pen, rep_pen):
     bmax = torch.ops.custom_op.comfy_qwen35_topk_s1(logits, pen_mask, anc_toks, has_pen, pres_pen, rep_pen)
@@ -242,3 +258,11 @@ def moss_situ_quant(y):
 
 def moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale):
     return torch.ops.custom_op.comfy_moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale)
+
+
+def moss_res_adaln_quant(x, res, gate, eff_scale, shift, eps):
+    return torch.ops.custom_op.comfy_moss_res_adaln_quant(x, res, gate, eff_scale, shift, eps)
+
+
+def moss_hnd_scale_quant(attn, scales):
+    return torch.ops.custom_op.comfy_moss_hnd_scale_quant(attn, scales)

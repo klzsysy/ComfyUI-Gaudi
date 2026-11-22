@@ -33,6 +33,8 @@ KERNELS = (
     ("dual_rms_cat", "dual_rmsnorm_cat_quant.c"),
     ("moss_situ_q", "moss_situ_quant.c"),
     ("moss_qkv_prep", "moss_qkv_prep.c"),
+    ("moss_res_adaln_q", "moss_res_adaln_quant.c"),
+    ("moss_hnd_scale_q", "moss_hnd_scale_quant.c"),
 )
 
 EXTRA_SOURCES = ("params.h", "glue.cpp", "bridge.cpp")

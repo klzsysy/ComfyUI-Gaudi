@@ -246,8 +246,32 @@ class Block(nn.Module):
         return qh, kh, vh, out_scales
 
     def _forward_hpu_post_attn_ffn(self, x, attn_out, out_scales, mod):
-        scaled = attn_out * out_scales[:, 0].view(24, 1, 1).to(attn_out.dtype)
-        out = self.proj["o"](scaled.transpose(0, 1).reshape(1, -1, 3072))
+        o_lin = self.proj["o"]
+        if comfy.ops.hpu_fp8_quantized_linear_ready(o_lin, x):
+            oq, os_ = _hpu_tpc.moss_hnd_scale_quant(attn_out.contiguous(), out_scales.contiguous())
+            out = comfy.ops.hpu_fp8_linear_prequant(o_lin, x, oq, os_)
+        else:
+            scaled = attn_out * out_scales[:, 0].view(24, 1, 1).to(attn_out.dtype)
+            out = o_lin(scaled.transpose(0, 1).reshape(1, -1, 3072))
+
+        up_lin = self.proj["ffn_up_gate"]
+        if (comfy.ops.hpu_fp8_quantized_linear_ready(up_lin, x)
+                and not getattr(self.norm2, "weight_function", None)):
+            norm_w, _, n_stream = comfy.ops.cast_bias_weight(self.norm2, x, offloadable=True)
+            eff_scale = (norm_w * (1 + mod[4])).reshape(-1).contiguous()
+            comfy.ops.uncast_bias_weight(self.norm2, norm_w, None, n_stream)
+            x_mid, q2, s2 = _hpu_tpc.moss_res_adaln_quant(
+                x.reshape(-1, 3072).contiguous(),
+                out.reshape(-1, 3072).contiguous(),
+                mod[2].reshape(-1).contiguous(),
+                eff_scale,
+                mod[3].reshape(-1).contiguous(),
+                self.norm2.eps,
+            )
+            ug = comfy.ops.hpu_fp8_linear_prequant(up_lin, x, q2, s2)
+            ffn_out = comfy.ops.linear_input_act(self.proj["ffn_down"], ug, "situ")
+            return x.copy_(torch.addcmul(x_mid.reshape(1, -1, 3072), ffn_out, mod[5]))
+
         x = residual(x, out, mod, 2, None)
         return residual(x, self._forward_ffn_modulated(x, mod), mod, 5, None)
 

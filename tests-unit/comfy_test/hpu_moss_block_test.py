@@ -227,6 +227,34 @@ def test_moss_tpc_kernels_accuracy_and_shapes(hpu_compiler):
                 assert (kh[:, rows:, 128].cpu() == -8192.0).all()
                 assert (vh[:, rows:, :].cpu().float() == 0.0).all()
 
+        # 3. moss_res_adaln_quant (odd rows=257, dim=3072)
+        xr = torch.randn(257, 3072, dtype=torch.bfloat16, device="hpu")
+        rr = torch.randn(257, 3072, dtype=torch.bfloat16, device="hpu") * 0.5
+        gr = torch.randn(3072, dtype=torch.bfloat16, device="hpu") * 0.2
+        ef = (torch.randn(3072, dtype=torch.bfloat16, device="hpu") * 0.1 + 1.0).contiguous()
+        sh = torch.randn(3072, dtype=torch.bfloat16, device="hpu") * 0.1
+        xm, rq, rsc = torch.compile(
+            lambda a, b, c, d, e: hpu_qwen35_tpc.moss_res_adaln_quant(a, b, c, d, e, 1e-6),
+            backend="hpu_backend", dynamic=False,
+        )(xr, rr, gr, ef, sh)
+        assert xm.shape == (257, 3072) and xm.dtype == torch.bfloat16
+        assert rq.shape == (257, 3072) and rq.dtype == torch.float8_e4m3fn
+        assert rsc.shape == (257,) and rsc.dtype == torch.float32
+        xm_ref = (xr.cpu().float() + rr.cpu().float() * gr.cpu().float())
+        rstd_ref = torch.rsqrt(xm_ref.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        yn_ref = xm_ref * rstd_ref * ef.cpu().float() + sh.cpu().float()
+        assert (xm.cpu().float() - xm_ref).norm() / xm_ref.norm() < 0.005
+        assert (rq.cpu().float() * rsc.cpu().unsqueeze(-1) - yn_ref).norm() / yn_ref.norm() < 0.035
+
+        # 4. moss_hnd_scale_quant (odd rows=257 tests both 2-row loop and tail)
+        ao = torch.randn(24, 257, 128, dtype=torch.bfloat16, device="hpu")
+        hsc = (torch.rand(24, 1, dtype=torch.float32, device="hpu") * 0.5 + 0.1).expand(24, 64).contiguous()
+        oq, osc = torch.compile(hpu_qwen35_tpc.moss_hnd_scale_quant, backend="hpu_backend", dynamic=False)(ao, hsc)
+        assert oq.shape == (257, 3072) and oq.dtype == torch.float8_e4m3fn
+        assert osc.shape == (257,) and osc.dtype == torch.float32
+        o_ref = (ao.cpu().float() * hsc[:, 0].cpu().view(24, 1, 1)).transpose(0, 1).reshape(257, 3072)
+        assert (oq.cpu().float() * osc.cpu().unsqueeze(-1) - o_ref).norm() / o_ref.norm() < 0.035
+
 
 @pytest.mark.parametrize("length", [4096, 4119])
 def test_moss_fp8_block_rmw_tpc_fast_path(hpu_compiler, monkeypatch, length):
@@ -262,6 +290,20 @@ def test_moss_fp8_block_rmw_tpc_fast_path(hpu_compiler, monkeypatch, length):
         rel = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
         assert torch.isfinite(actual).all() and rel < 0.04
 
+        # Verify 0 Dynamo graph breaks on both compiled stages and LoRA weight_function fallback guard.
+        aligned = 1 if (length % 128) == 0 else 0
+        qh_e, kh_e, vh_e, osc_e = block._forward_hpu_pre_attn(x.clone(), mod, pe_cs, aligned)
+        ao_e = hpu_attention.rmw_fp8_attention_prepared(qh_e, kh_e, vh_e)
+        assert torch._dynamo.explain(moss.Block._forward_hpu_pre_attn)(block, x.clone(), mod, pe_cs, aligned).graph_break_count == 0
+        assert torch._dynamo.explain(moss.Block._forward_hpu_post_attn_ffn)(block, x.clone(), ao_e, osc_e, mod).graph_break_count == 0
+        block.proj["o"].weight_function.append(lambda w: w)
+        try:
+            assert not comfy.ops.hpu_fp8_quantized_linear_ready(block.proj["o"], x)
+            out_lora = block._forward_hpu_post_attn_ffn(x.clone(), ao_e, osc_e, mod)
+            assert torch.isfinite(out_lora).all()
+        finally:
+            block.proj["o"].weight_function.clear()
+
         # Verify fallback when TPC extension is disabled (still uses RMW FP8 attention cleanly).
         monkeypatch.setattr(moss, "_hpu_tpc", None)
         monkeypatch.setattr(comfy.ops, "_hpu_tpc", None)
@@ -276,3 +318,44 @@ def test_moss_fp8_block_rmw_tpc_fast_path(hpu_compiler, monkeypatch, length):
         monkeypatch.setattr(hpu_attention, "rmw_fp8_attention", lambda *a: pytest.fail("RMW should be bypassed"))
         out_no_fp8 = block(x.clone(), mod, pe, {"fp8_attention": False, "_moss_hpu_pe_cs": pe_cs})
         assert torch.isfinite(out_no_fp8).all()
+
+
+def test_moss_fp8_block_rmw_async_lifetime(hpu_compiler):
+    from comfy.ldm.modules import hpu_attention
+    from comfy.ldm.moss_image import hpu as moss_hpu
+    from comfy.text_encoders import hpu_qwen35_tpc
+
+    if not hpu_qwen35_tpc.available:
+        pytest.skip("HPU TPC extension not active in GC_KERNEL_PATH")
+    torch.manual_seed(2026)
+    block = moss.Block(3072, 8192, 24, fused_qkv=True, dtype=torch.bfloat16, device="hpu", operations=comfy.ops.manual_cast)
+    for name, value in block.named_parameters():
+        value.data.copy_(torch.randn(value.shape, dtype=torch.bfloat16, device="hpu") * 0.02 + (1 if "norm" in name else 0))
+    for pname, in_f, out_f in (("qkv", 3072, 9216), ("o", 3072, 3072), ("ffn_up_gate", 3072, 16384), ("ffn_down", 8192, 3072)):
+        block.proj[pname] = _make_hpu_fp8_linear(in_f, out_f)
+    block.hpu_fp8 = True
+
+    cases = []
+    for length in (4096, 4119):
+        x = torch.randn(1, length, 3072, dtype=torch.bfloat16, device="hpu")
+        mod = tuple(torch.randn(1, 1, 3072, dtype=torch.bfloat16, device="hpu") * 0.1 for _ in range(6))
+        angle = torch.randn(1, length, 1, 64)
+        pe = torch.stack((angle.cos(), -angle.sin(), angle.sin(), angle.cos()), dim=-1).reshape(1, length, 1, 64, 2, 2).to("hpu")
+        pe_cs = moss_hpu.pack_blockwise_pe_cs(pe)
+        opts = {"fp8_attention": True, "_moss_hpu_blockwise_rope": True, "_moss_hpu_pe_cs": pe_cs}
+        cases.append((x, mod, pe, opts))
+
+    with torch.no_grad():
+        refs = [block(x.clone(), mod, pe, opts).cpu() for x, mod, pe, opts in cases]
+        rt = hpu_attention._fp8_runtime()
+        async_outs = []
+        for step in range(24):
+            x, mod, pe, opts = cases[step % 2]
+            async_outs.append((step % 2, block(x.clone(), mod, pe, opts)))
+            assert len(rt._inflight.inflight) <= rt._inflight.max_inflight
+        hpu_attention.release_inflight()
+        assert len(rt._inflight.inflight) == 0
+        for idx, out in async_outs:
+            out_cpu = out.cpu()
+            assert torch.isfinite(out_cpu).all()
+            assert torch.equal(out_cpu, refs[idx])

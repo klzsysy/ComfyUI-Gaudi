@@ -2219,6 +2219,9 @@ def synchronize():
         torch.npu.synchronize()
     elif is_intel_hpu():
         torch.hpu.synchronize()
+        hpu_attn = sys.modules.get("comfy.ldm.modules.hpu_attention")
+        if hpu_attn is not None and hasattr(hpu_attn, "release_inflight"):
+            hpu_attn.release_inflight()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -2237,6 +2240,9 @@ def soft_empty_cache(force=False):
         torch.mlu.empty_cache()
     elif is_intel_hpu():
         torch.hpu.synchronize()
+        hpu_attn = sys.modules.get("comfy.ldm.modules.hpu_attention")
+        if hpu_attn is not None and hasattr(hpu_attn, "release_inflight"):
+            hpu_attn.release_inflight()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()

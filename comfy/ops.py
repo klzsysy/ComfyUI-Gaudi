@@ -1177,6 +1177,33 @@ if hasattr(torch, "hpu"):
         _hpu_tpc = None
 
 
+def hpu_fp8_quantized_linear_ready(linear, x):
+    weight = getattr(linear, "weight", None)
+    if not isinstance(weight, QuantizedTensor):
+        return False
+    hpu_fp8_layout = (getattr(linear, "layout_type", None) == "HPUFP8E4M3Layout"
+                      or getattr(weight, "_layout_type", None) == "HPUFP8E4M3Layout")
+    return (hpu_fp8_layout
+            and not comfy.model_management.in_training
+            and not getattr(linear, "comfy_force_forward", False)
+            and not getattr(linear, "_full_precision_mm", False)
+            and not getattr(linear, "weight_function", None)
+            and not getattr(linear, "bias_function", None)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and getattr(linear, "input_scale", None) is None
+            and x.device.type == "hpu" and x.dtype == torch.bfloat16
+            and not x.requires_grad and not torch.is_grad_enabled())
+
+
+def hpu_fp8_linear_prequant(linear, ref_input, q_flat, scale_1d):
+    run_every_op()
+    with CastBiasWeightContext(linear, ref_input, dtype=linear.weight.dtype, bias_dtype=ref_input.dtype,
+                               offloadable=True, compute_dtype=ref_input.dtype, want_requant=True) as (w, b):
+        out = torch.ops.hpu.fp8_gemm_v2(q_flat, False, w._qdata, True, None, ref_input.dtype,
+                                        scale_1d.unsqueeze(-1), w._params.scale, b, False)
+        return out.reshape(*ref_input.shape[:-1], w._qdata.shape[0])
+
+
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
                      residual=None, residual_scale=None):
     if isinstance(linear, CombinedLinear):
@@ -1186,25 +1213,12 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
     quantized = isinstance(weight, QuantizedTensor)
     hpu_fp8_layout = (getattr(linear, "layout_type", None) == "HPUFP8E4M3Layout"
                       or (quantized and getattr(weight, "_layout_type", None) == "HPUFP8E4M3Layout"))
-    if (hpu_fp8_layout and quantized and input_act == "situ"
+    if (hpu_fp8_quantized_linear_ready(linear, x) and input_act == "situ"
             and _hpu_tpc is not None and _hpu_tpc.available
-            and not comfy.model_management.in_training
-            and not getattr(linear, "comfy_force_forward", False)
-            and not getattr(linear, "_full_precision_mm", False)
-            and not getattr(linear, "weight_function", None)
-            and not getattr(linear, "bias_function", None)
-            and getattr(linear, "pre_quant_scale", None) is None
-            and getattr(linear, "input_scale", None) is None
-            and x.device.type == "hpu" and x.dtype == torch.bfloat16
-            and not x.requires_grad and not torch.is_grad_enabled()
             and (x.shape[-1] % 512) == 0 and 0 < x.shape[-1] <= 16384):
-        with CastBiasWeightContext(linear, x, dtype=weight.dtype, bias_dtype=x.dtype,
-                                   offloadable=True, compute_dtype=x.dtype, want_requant=True) as (w, b):
-            flat = x.reshape(-1, x.shape[-1]).contiguous()
-            q, scale = _hpu_tpc.moss_situ_quant(flat)
-            out = torch.ops.hpu.fp8_gemm_v2(q, False, w._qdata, True, None, x.dtype,
-                                            scale.unsqueeze(-1), w._params.scale, b, False)
-            out = out.reshape(*x.shape[:-1], w._qdata.shape[0])
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        q, scale = _hpu_tpc.moss_situ_quant(flat)
+        out = hpu_fp8_linear_prequant(linear, x, q, scale)
         return _linear_residual(out, residual, residual_scale)
     if (comfy.model_management.in_training or getattr(linear, "comfy_force_forward", False) or getattr(linear, "_full_precision_mm", False)
             or hpu_fp8_layout
