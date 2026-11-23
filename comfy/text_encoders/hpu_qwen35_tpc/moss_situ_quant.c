@@ -19,6 +19,7 @@ void main(tensor y_in, tensor out_q, tensor out_scale, int dim, int rows) {
     const bfloat p2_c = (bfloat)1.331023f;
     const bfloat p3_c = (bfloat)-0.443674f;
     const float inv_240 = 1.0f / 240.0f;
+    const shuffle_mask_results_t m32 = gen_shuffle_map_32bit_nolut();
 
     const int r0 = begin[0];
     const int r1 = (end[0] < rows) ? end[0] : rows;
@@ -59,7 +60,7 @@ void main(tensor y_in, tensor out_q, tensor out_scale, int dim, int rows) {
         }
         bfloat128 amax_b = v_bf16_max_b(amax_b0, amax_b1, 0, amax_b0, 1, 0);
         float128 amax_f = v_convert_bf16_to_f32_all_b(amax_b, 0, (float128){0}, 1, 0);
-        float64 amax = v_f32_reduce_nolut_max(v_f32_max_b(amax_f.v1, amax_f.v2, 0, amax_f.v1, 1, 0));
+        float64 amax = v_f32_reduce_nolut_noshuffle_max(v_f32_max_b(amax_f.v1, amax_f.v2, 0, amax_f.v1, 1, 0), m32);
         float64 scale = v_f32_max_b(amax, 1e-12f, 0, amax, 1, 0) * inv_240;
         v_f32_st_tnsr_partial((int5){r, 0, 0, 0, 0}, out_scale, scale, 0, 0);
         float64 inv_s = (float64)1.0f / scale;

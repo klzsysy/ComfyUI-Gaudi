@@ -175,6 +175,14 @@ if available:
     @torch.library.register_fake("custom_op::comfy_moss_qkv_prep")
     def _fake_moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale):
         rows = qkv.shape[0]
+        if aligned == 2:
+            k_pad = ((rows + 511) // 512) * 512
+            return (
+                qkv.new_empty((24, rows, 128), dtype=torch.bfloat16),
+                qkv.new_empty((24, k_pad, 128), dtype=torch.bfloat16),
+                qkv.new_empty((24, k_pad // 2, 256), dtype=torch.float8_e4m3fn),
+                qkv.new_empty((24, 64), dtype=torch.float32),
+            )
         k_pad = ((rows + 127) // 128) * 128
         qk_dim = 128 if aligned else 192
         return (
@@ -198,6 +206,21 @@ if available:
         return (
             attn.new_empty((rows, 3072), dtype=torch.float8_e4m3fn),
             attn.new_empty((rows,), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_moss_hnd_scale_sum_quant")
+    def _fake_moss_hnd_scale_sum_quant(attn, scales, sum_in):
+        rows = attn.shape[1]
+        return (
+            attn.new_empty((rows, 3072), dtype=torch.float8_e4m3fn),
+            attn.new_empty((rows,), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_moss_expmax_fp8")
+    def _fake_moss_expmax_fp8(scores, valid_keys):
+        return (
+            scores.new_empty(scores.shape, dtype=torch.float8_e4m3fn),
+            scores.new_empty((scores.shape[0],), dtype=torch.float32),
         )
 
 
@@ -257,7 +280,12 @@ def moss_situ_quant(y):
 
 
 def moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale):
-    return torch.ops.custom_op.comfy_moss_qkv_prep(qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale)
+    qh, kh, vh, out_scales = torch.ops.custom_op.comfy_moss_qkv_prep(
+        qkv, qn_w, kn_w, pe_cs, aligned, eps, q_scale, k_scale,
+    )
+    if aligned == 2:
+        vh = vh.view(24, vh.shape[1] * 2, 128)
+    return qh, kh, vh, out_scales
 
 
 def moss_res_adaln_quant(x, res, gate, eff_scale, shift, eps):
@@ -266,3 +294,11 @@ def moss_res_adaln_quant(x, res, gate, eff_scale, shift, eps):
 
 def moss_hnd_scale_quant(attn, scales):
     return torch.ops.custom_op.comfy_moss_hnd_scale_quant(attn, scales)
+
+
+def moss_hnd_scale_sum_quant(attn, scales, sum_in):
+    return torch.ops.custom_op.comfy_moss_hnd_scale_sum_quant(attn, scales, sum_in)
+
+
+def moss_expmax_fp8(scores, valid_keys):
+    return torch.ops.custom_op.comfy_moss_expmax_fp8(scores, valid_keys)

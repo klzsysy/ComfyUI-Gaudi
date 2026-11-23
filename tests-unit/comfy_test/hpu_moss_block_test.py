@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -255,6 +257,77 @@ def test_moss_tpc_kernels_accuracy_and_shapes(hpu_compiler):
         o_ref = (ao.cpu().float() * hsc[:, 0].cpu().view(24, 1, 1)).transpose(0, 1).reshape(257, 3072)
         assert (oq.cpu().float() * osc.cpu().unsqueeze(-1) - o_ref).norm() / o_ref.norm() < 0.035
 
+        # 5. moss_hnd_scale_sum_quant (odd rows=257, padded stat_stride=288)
+        sum_in = (torch.rand(24, 288, dtype=torch.float32, device="hpu") * 50.0 + 1.0).contiguous()
+        oq2, osc2 = torch.compile(hpu_qwen35_tpc.moss_hnd_scale_sum_quant, backend="hpu_backend", dynamic=False)(ao, hsc, sum_in)
+        assert oq2.shape == (257, 3072) and oq2.dtype == torch.float8_e4m3fn
+        assert osc2.shape == (257,) and osc2.dtype == torch.float32
+        o_ref2 = (ao.cpu().float() * (hsc[:, 0:1].cpu() / sum_in[:, :257].cpu()).unsqueeze(-1)).transpose(0, 1).reshape(257, 3072)
+        assert (oq2.cpu().float() * osc2.cpu().unsqueeze(-1) - o_ref2).norm() / o_ref2.norm() < 0.035
+
+        # 6. moss_qkv_prep mode=2 (qk_dim=128 always, Q@K^T channel-permutation invariant, all_lanes permuted V_fp8)
+        q_sc_em = (128.0 * math.log2(math.e)) / math.sqrt(128.0)
+        for rows in (256, 261):
+            k_pad512 = ((rows + 511) // 512) * 512
+            qkv = torch.randn(rows, 9216, dtype=torch.bfloat16, device="hpu")
+            angle = torch.randn(1, rows, 1, 64)
+            pe = torch.stack((angle.cos(), -angle.sin(), angle.sin(), angle.cos()), dim=-1).reshape(1, rows, 1, 64, 2, 2).to("hpu")
+            pe_cs = moss_hpu.pack_blockwise_pe_cs(pe)
+            qh, kh, vh, out_sc = torch.compile(
+                lambda a, b, c, d: hpu_qwen35_tpc.moss_qkv_prep(a, b, c, d, 2, 1e-6, q_sc_em, 1.0),
+                backend="hpu_backend", dynamic=False,
+            )(qkv, qw, kw, pe_cs)
+            assert qh.shape == (24, rows, 128) and kh.shape == (24, k_pad512, 128)
+            assert vh.shape == (24, k_pad512, 128) and out_sc.shape == (24, 64)
+            qr, kr, vr = qkv.unsqueeze(0).chunk(3, dim=-1)
+            qr_ref, kr_ref = moss_hpu.rms_rope_split_half(
+                qr.view(1, rows, 24, 128), kr.view(1, rows, 24, 128), pe, qw, kw, 1e-6, blockwise=True
+            )
+            qh_ref = (qr_ref.transpose(1, 2)[0] * q_sc_em).cpu().float()
+            kh_ref = kr_ref.transpose(1, 2)[0].cpu().float()
+            s_act = torch.bmm(qh.cpu().float(), kh[:, :rows, :].cpu().float().transpose(1, 2))
+            s_ref = torch.bmm(qh_ref, kh_ref.transpose(1, 2))
+            assert (s_act - s_ref).norm() / s_ref.norm() < 0.015
+            assert (kh[:, rows:, :].cpu() == 0.0).all()
+            expected_perm = [(j >> 1) + (128 if (j & 1) else 0) for j in range(256)]
+            perm_idx = torch.tensor([blk * 256 + p for blk in range(k_pad512 // 256) for p in expected_perm], dtype=torch.long)
+            vh_ref_pad = torch.zeros((24, k_pad512, 128), dtype=torch.float32)
+            vh_ref_pad[:, :rows, :] = vr.view(1, rows, 24, 128).transpose(1, 2)[0].cpu().float()
+            vh_ref_perm = vh_ref_pad.index_select(1, perm_idx)
+            v_deq = vh.cpu().float() * out_sc[:, 0].cpu().view(24, 1, 1)
+            assert (v_deq - vh_ref_perm).norm() / vh_ref_perm.norm() < 0.035
+
+        # 7. moss_expmax_fp8: fast path (odd4=0 & odd4=1) AND general 2-pass fallback (small, large, rows=1)
+        inv_scale = 1.0 / (128.0 * math.log2(math.e))
+        perm256 = [(j >> 1) + (128 if (j & 1) else 0) for j in range(256)]
+        inv_perm256 = [0] * 256
+        for dst_i, src_i in enumerate(perm256):
+            inv_perm256[src_i] = dst_i
+        for rows, k_pad, valid_keys in (
+            (48, 1536, 1500),  # fast path: body_v=8 (odd4=0)
+            (48, 4096, 4096),  # fast path: body_v=28 (odd4=1)
+            (48, 4608, 4119),  # fast path: body_v=32 (odd4=0)
+            (48, 8704, 8506),  # fast path: body_v=64 (odd4=0)
+            (48, 512, 400),    # fallback: k_pad < 1536
+            (48, 9216, 9000),  # fallback: k_pad > 8704
+            (1, 4096, 4000),   # fallback: single row
+        ):
+            s = (torch.randn(rows, k_pad, dtype=torch.bfloat16, device="hpu") * (2.0 / inv_scale)).contiguous()
+            s[:, valid_keys:] = 5000.0
+            p_fp8, sm = torch.compile(
+                lambda x: hpu_qwen35_tpc.moss_expmax_fp8(x, valid_keys),
+                backend="hpu_backend", dynamic=False,
+            )(s)
+            assert p_fp8.shape == (rows, k_pad) and p_fp8.dtype == torch.float8_e4m3fn
+            assert sm.shape == (rows,) and sm.dtype == torch.float32
+            assert torch.isfinite(sm).all() and (sm.cpu() > 0).all()
+            inv_idx = torch.tensor([blk * 256 + p for blk in range(k_pad // 256) for p in inv_perm256], dtype=torch.long)
+            p_lin = p_fp8.cpu().float().index_select(1, inv_idx)
+            assert (p_lin[:, valid_keys:] == 0.0).all()
+            p_prob = p_lin[:, :valid_keys] / sm.cpu().unsqueeze(-1)
+            p_ref = torch.softmax(s[:, :valid_keys].cpu().float() * inv_scale, dim=-1)
+            assert (p_prob - p_ref).norm() / p_ref.norm() < 0.045
+
 
 @pytest.mark.parametrize("length", [4096, 4119])
 def test_moss_fp8_block_rmw_tpc_fast_path(hpu_compiler, monkeypatch, length):
@@ -286,34 +359,38 @@ def test_moss_fp8_block_rmw_tpc_fast_path(hpu_compiler, monkeypatch, length):
         working = x.clone()
         actual = block(working, mod, pe, opts)
         assert actual.data_ptr() == working.data_ptr()
-        assert hpu_attention._fp8_runtime().last_workspace <= 256
+        rt = hpu_attention._fp8_runtime()
+        assert rt.last_mode == "expmax"
+        assert rt.last_workspace <= 16 * 1024 * 1024
         rel = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
         assert torch.isfinite(actual).all() and rel < 0.04
 
         # Verify 0 Dynamo graph breaks on both compiled stages and LoRA weight_function fallback guard.
-        aligned = 1 if (length % 128) == 0 else 0
-        qh_e, kh_e, vh_e, osc_e = block._forward_hpu_pre_attn(x.clone(), mod, pe_cs, aligned)
-        ao_e = hpu_attention.rmw_fp8_attention_prepared(qh_e, kh_e, vh_e)
-        assert torch._dynamo.explain(moss.Block._forward_hpu_pre_attn)(block, x.clone(), mod, pe_cs, aligned).graph_break_count == 0
-        assert torch._dynamo.explain(moss.Block._forward_hpu_post_attn_ffn)(block, x.clone(), ao_e, osc_e, mod).graph_break_count == 0
+        qh_e, kh_e, vh_e, osc_e = block._forward_hpu_pre_attn(x.clone(), mod, pe_cs, 2)
+        ao_e, sum_e = hpu_attention.rmw_fp8_expmax_attention_prepared(qh_e, kh_e, vh_e, length)
+        assert torch._dynamo.explain(moss.Block._forward_hpu_pre_attn)(block, x.clone(), mod, pe_cs, 2).graph_break_count == 0
+        assert torch._dynamo.explain(moss.Block._forward_hpu_post_attn_ffn)(block, x.clone(), ao_e, osc_e, mod, sum_e).graph_break_count == 0
         block.proj["o"].weight_function.append(lambda w: w)
         try:
             assert not comfy.ops.hpu_fp8_quantized_linear_ready(block.proj["o"], x)
-            out_lora = block._forward_hpu_post_attn_ffn(x.clone(), ao_e, osc_e, mod)
-            assert torch.isfinite(out_lora).all()
+            out_lora = block._forward_hpu_post_attn_ffn(x.clone(), ao_e, osc_e, mod, sum_e)
+            rel_lora = (out_lora.cpu().float() - actual.cpu().float()).norm() / actual.cpu().float().norm()
+            assert torch.isfinite(out_lora).all() and rel_lora < 0.03
         finally:
             block.proj["o"].weight_function.clear()
 
-        # Verify fallback when TPC extension is disabled (still uses RMW FP8 attention cleanly).
+        # Verify fallback when TPC extension is disabled (still uses legacy RMW FP8 softmax cleanly).
         monkeypatch.setattr(moss, "_hpu_tpc", None)
         monkeypatch.setattr(comfy.ops, "_hpu_tpc", None)
         working_notpc = x.clone()
         actual_notpc = block(working_notpc, mod, pe, opts)
         assert actual_notpc.data_ptr() == working_notpc.data_ptr()
+        assert rt.last_mode == "softmax" and rt.last_workspace <= 256
         rel_notpc = (actual_notpc.cpu().float() - expected.float()).norm() / expected.float().norm()
         assert torch.isfinite(actual_notpc).all() and rel_notpc < 0.04
 
         # Verify explicit fp8_attention=False bypasses RMW FP8 attention completely.
+        monkeypatch.setattr(hpu_attention, "rmw_fp8_expmax_attention_prepared", lambda *a: pytest.fail("RMW expmax should be bypassed"))
         monkeypatch.setattr(hpu_attention, "rmw_fp8_attention_prepared", lambda *a: pytest.fail("RMW prepared should be bypassed"))
         monkeypatch.setattr(hpu_attention, "rmw_fp8_attention", lambda *a: pytest.fail("RMW should be bypassed"))
         out_no_fp8 = block(x.clone(), mod, pe, {"fp8_attention": False, "_moss_hpu_pe_cs": pe_cs})

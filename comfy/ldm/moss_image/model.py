@@ -1,4 +1,5 @@
 from functools import lru_cache
+import math
 
 import torch
 from torch import nn
@@ -230,7 +231,11 @@ class Block(nn.Module):
         del y
         q_scale_w, _, q_stream = comfy.ops.cast_bias_weight(self.q_norm, qkv, offloadable=True)
         k_scale_w, _, k_stream = comfy.ops.cast_bias_weight(self.k_norm, qkv, offloadable=True)
-        scale = 128.0 ** -0.25
+        if aligned == 2:
+            q_scale = (128.0 * math.log2(math.e)) / math.sqrt(128.0)
+            k_scale = 1.0
+        else:
+            q_scale = k_scale = 128.0 ** -0.25
         qh, kh, vh, out_scales = _hpu_tpc.moss_qkv_prep(
             qkv.reshape(-1, 9216).contiguous(),
             q_scale_w.contiguous(),
@@ -238,20 +243,30 @@ class Block(nn.Module):
             pe_cs,
             aligned,
             self.q_norm.eps,
-            scale,
-            scale,
+            q_scale,
+            k_scale,
         )
         comfy.ops.uncast_bias_weight(self.q_norm, q_scale_w, None, q_stream)
         comfy.ops.uncast_bias_weight(self.k_norm, k_scale_w, None, k_stream)
         return qh, kh, vh, out_scales
 
-    def _forward_hpu_post_attn_ffn(self, x, attn_out, out_scales, mod):
+    def _forward_hpu_post_attn_ffn(self, x, attn_out, out_scales, mod, attn_sum=None):
         o_lin = self.proj["o"]
         if comfy.ops.hpu_fp8_quantized_linear_ready(o_lin, x):
-            oq, os_ = _hpu_tpc.moss_hnd_scale_quant(attn_out.contiguous(), out_scales.contiguous())
+            if attn_sum is not None:
+                oq, os_ = _hpu_tpc.moss_hnd_scale_sum_quant(
+                    attn_out.contiguous(), out_scales.contiguous(), attn_sum.contiguous(),
+                )
+            else:
+                oq, os_ = _hpu_tpc.moss_hnd_scale_quant(attn_out.contiguous(), out_scales.contiguous())
             out = comfy.ops.hpu_fp8_linear_prequant(o_lin, x, oq, os_)
         else:
-            scaled = attn_out * out_scales[:, 0].view(24, 1, 1).to(attn_out.dtype)
+            if attn_sum is not None:
+                inv_sum = attn_sum[:, :attn_out.shape[1]].clamp_min(1e-12).reciprocal()
+                eff = (out_scales[:, 0:1] * inv_sum).unsqueeze(-1).to(attn_out.dtype)
+                scaled = attn_out * eff
+            else:
+                scaled = attn_out * out_scales[:, 0].view(24, 1, 1).to(attn_out.dtype)
             out = o_lin(scaled.transpose(0, 1).reshape(1, -1, 3072))
 
         up_lin = self.proj["ffn_up_gate"]
@@ -287,12 +302,16 @@ class Block(nn.Module):
                         and _hpu_tpc is not None and _hpu_tpc.available
                         and pe.dtype == torch.float32 and pe_cs is not None
                         and pe_cs.device == x.device and pe_cs.dtype == torch.float32
-                        and pe_cs.shape == (x.shape[1], 128)
-                        and hpu_attention.rmw_fp8_supported(x.shape[1])):
-                    aligned = 1 if (x.shape[1] % 128) == 0 else 0
-                    qh, kh, vh, out_scales = _compiled_block_pre_attn()(self, x, mod, pe_cs, aligned)
-                    attn_out = hpu_attention.rmw_fp8_attention_prepared(qh, kh, vh)
-                    return _compiled_block_post_attn_ffn()(self, x, attn_out, out_scales, mod)
+                        and pe_cs.shape == (x.shape[1], 128)):
+                    if hpu_attention.rmw_fp8_expmax_supported(x.shape[1]):
+                        qh, kh, vh, out_scales = _compiled_block_pre_attn()(self, x, mod, pe_cs, 2)
+                        attn_out, attn_sum = hpu_attention.rmw_fp8_expmax_attention_prepared(qh, kh, vh, x.shape[1])
+                        return _compiled_block_post_attn_ffn()(self, x, attn_out, out_scales, mod, attn_sum)
+                    if hpu_attention.rmw_fp8_supported(x.shape[1]):
+                        aligned = 1 if (x.shape[1] % 128) == 0 else 0
+                        qh, kh, vh, out_scales = _compiled_block_pre_attn()(self, x, mod, pe_cs, aligned)
+                        attn_out = hpu_attention.rmw_fp8_attention_prepared(qh, kh, vh)
+                        return _compiled_block_post_attn_ffn()(self, x, attn_out, out_scales, mod)
                 return _compiled_block_forward()(self, x, mod, pe, transformer_options)
             attention_forward, ffn_forward = _compiled_block_ops()
         # Keep modulation and residual rounding outside the compiled projections.

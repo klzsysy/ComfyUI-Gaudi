@@ -35,6 +35,8 @@ KERNELS = (
     ("moss_qkv_prep", "moss_qkv_prep.c"),
     ("moss_res_adaln_q", "moss_res_adaln_quant.c"),
     ("moss_hnd_scale_q", "moss_hnd_scale_quant.c"),
+    ("moss_hnd_scale_sum_q", "moss_hnd_scale_sum_quant.c"),
+    ("moss_expmax_fp8", "moss_expmax_fp8.c"),
 )
 
 EXTRA_SOURCES = ("params.h", "glue.cpp", "bridge.cpp")

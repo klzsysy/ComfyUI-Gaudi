@@ -73,3 +73,7 @@ struct MossQkvPrepParams {
 struct MossResAdalnParams {
     float eps;
 };
+
+struct MossExpMaxParams {
+    int32_t valid_keys;
+};

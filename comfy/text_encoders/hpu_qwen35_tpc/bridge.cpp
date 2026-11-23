@@ -273,8 +273,18 @@ static std::tuple<at::Tensor, at::Tensor> exec_moss_situ_q(const at::Tensor& y) 
 static habana::PartialOutputMetaDataVector meta_moss_qkv_prep(const at::Stack& s) {
     auto qkv = s.at(0).toTensor();
     int64_t rows = qkv.size(0);
+    int64_t mode = s.at(4).toInt();
+    if (mode == 2) {
+        int64_t k_pad = ((rows + 511) / 512) * 512;
+        return {
+            {at::kBFloat16, {24, rows, 128}},
+            {at::kBFloat16, {24, k_pad, 128}},
+            {at::kFloat8_e4m3fn, {24, k_pad / 2, 256}},
+            {at::kFloat, {24, 64}},
+        };
+    }
     int64_t k_pad = ((rows + 127) / 128) * 128;
-    int64_t qk_dim = s.at(4).toInt() ? 128 : 192;
+    int64_t qk_dim = mode ? 128 : 192;
     return {
         {at::kBFloat16, {24, rows, qk_dim}},
         {at::kBFloat16, {24, k_pad, qk_dim}},
@@ -333,6 +343,32 @@ static std::tuple<at::Tensor, at::Tensor> exec_moss_hnd_scale_q(
     return {r[0], r[1]};
 }
 
+static std::tuple<at::Tensor, at::Tensor> exec_moss_hnd_scale_sum_q(
+    const at::Tensor& attn, const at::Tensor& scales, const at::Tensor& sum_in) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_moss_hnd_scale_sum_quant");
+    auto r = op.execute({attn, scales, sum_in});
+    return {r[0], r[1]};
+}
+
+static habana::PartialOutputMetaDataVector meta_moss_expmax_fp8(const at::Stack& s) {
+    auto scores = s.at(0).toTensor();
+    return {
+        {at::kFloat8_e4m3fn, {scores.size(0), scores.size(1)}},
+        {at::kFloat, {scores.size(0)}},
+    };
+}
+static std::shared_ptr<void> fill_moss_expmax_fp8(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(MossExpMaxParams);
+    params->valid_keys = static_cast<int32_t>(s.at(1).toInt());
+    return params;
+}
+static std::tuple<at::Tensor, at::Tensor> exec_moss_expmax_fp8(
+    const at::Tensor& scores, int64_t valid_keys) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_moss_expmax_fp8");
+    auto r = op.execute({scores, valid_keys});
+    return {r[0], r[1]};
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
     lib.def("comfy_qwen35_topk_s1(Tensor logits, Tensor pen_mask, Tensor anc_toks, int has_pen, float pres_pen, float rep_pen) -> Tensor");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen35_topk_s1", "comfy_topk_s1_bmax", meta_topk_s1, fill_topk_s1);
@@ -384,6 +420,12 @@ TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
 
     lib.def("comfy_moss_hnd_scale_quant(Tensor attn, Tensor scales) -> (Tensor, Tensor)");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_hnd_scale_quant", "comfy_moss_hnd_scale_quant_fp8", meta_moss_hnd_scale_q, nullptr);
+
+    lib.def("comfy_moss_hnd_scale_sum_quant(Tensor attn, Tensor scales, Tensor sum_in) -> (Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_hnd_scale_sum_quant", "comfy_moss_hnd_scale_sum_quant_fp8", meta_moss_hnd_scale_q, nullptr);
+
+    lib.def("comfy_moss_expmax_fp8(Tensor scores, int valid_keys) -> (Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_expmax_fp8", "comfy_moss_expmax_fp8", meta_moss_expmax_fp8, fill_moss_expmax_fp8);
 }
 
 TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
@@ -404,4 +446,6 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
     lib.impl("comfy_moss_qkv_prep", exec_moss_qkv_prep);
     lib.impl("comfy_moss_res_adaln_quant", exec_moss_res_adaln_q);
     lib.impl("comfy_moss_hnd_scale_quant", exec_moss_hnd_scale_q);
+    lib.impl("comfy_moss_hnd_scale_sum_quant", exec_moss_hnd_scale_sum_q);
+    lib.impl("comfy_moss_expmax_fp8", exec_moss_expmax_fp8);
 }
