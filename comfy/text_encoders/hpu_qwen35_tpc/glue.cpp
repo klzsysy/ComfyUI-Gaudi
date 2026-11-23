@@ -24,6 +24,7 @@ extern "C" const unsigned char moss_res_adaln_q_start[], moss_res_adaln_q_end[];
 extern "C" const unsigned char moss_hnd_scale_q_start[], moss_hnd_scale_q_end[];
 extern "C" const unsigned char moss_hnd_scale_sum_q_start[], moss_hnd_scale_sum_q_end[];
 extern "C" const unsigned char moss_expmax_fp8_start[], moss_expmax_fp8_end[];
+extern "C" const unsigned char qwen_expmax_bf16_start[], qwen_expmax_bf16_end[];
 
 static const char* const kGuids[] = {
     "comfy_topk_s1_bmax",
@@ -45,6 +46,7 @@ static const char* const kGuids[] = {
     "comfy_moss_hnd_scale_quant_fp8",
     "comfy_moss_hnd_scale_sum_quant_fp8",
     "comfy_moss_expmax_fp8",
+    "comfy_qwen_expmax_bf16",
 };
 static constexpr uint32_t kNumGuids = sizeof(kGuids) / sizeof(kGuids[0]);
 
@@ -312,6 +314,18 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId device, const ShapeInferenc
         std::memset(&o1, 0, sizeof(TensorGeometry));
         o1.dims = 1; o1.dataType = DATA_F32;
         o1.maxSizes[0] = o1.minSizes[0] = sg.maxSizes[1];
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_expmax_bf16")) {
+        const auto& sg = p->inputTensors[0]->geometry;
+        auto& o0 = out->outputTensors[0]->geometry;
+        o0 = sg; o0.dataType = DATA_BF16;
+        for (int oi = 1; oi <= 2; ++oi) {
+            auto& ox = out->outputTensors[oi]->geometry;
+            std::memset(&ox, 0, sizeof(TensorGeometry));
+            ox.dims = 1; ox.dataType = DATA_F32;
+            ox.maxSizes[0] = ox.minSizes[0] = sg.maxSizes[1];
+        }
         return GLUE_SUCCESS;
     }
     return GLUE_NODE_NOT_FOUND;
@@ -767,6 +781,47 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
         std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
         out->kernel.paramsNr = 3;
         return copy_elf(out, moss_expmax_fp8_start, moss_expmax_fp8_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_expmax_bf16")) {
+        if (p->inputTensorNr != 1 || p->outputTensorNr != 3) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const MossExpMaxParams*>(p->nodeParams.nodeParams);
+        const auto& sg = p->inputTensors[0].geometry;
+        uint64_t k_pad = sg.maxSizes[0];
+        uint64_t rows = sg.maxSizes[1];
+        if (sg.dims != 2 || sg.dataType != DATA_BF16 || k_pad < 128 || (k_pad % 128) != 0 || rows == 0
+            || !prm || prm->valid_keys <= 0 || static_cast<uint64_t>(prm->valid_keys) > k_pad)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = rows;
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        auto& ia = out->inputTensorAccessPattern[0];
+        std::memset(&ia, 0, sizeof(TensorAccessPattern));
+        ia.allRequired = 0;
+        ia.fullyAccessedOnce = 0;
+        ia.mapping[0] = {0, 0.0f, 0.0f, float(k_pad - 1), true};
+        ia.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        auto& o0 = out->outputTensorAccessPattern[0];
+        std::memset(&o0, 0, sizeof(TensorAccessPattern));
+        o0.allRequired = 0;
+        o0.noRmwAccess = 1;
+        o0.fullyWritten = 1;
+        o0.inputsReusability = 1;
+        o0.inputReusabilityBinding = 1;
+        o0.mapping[0] = {0, 0.0f, 0.0f, float(k_pad - 1), true};
+        o0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        for (int oi = 1; oi <= 2; ++oi) {
+            auto& ox = out->outputTensorAccessPattern[oi];
+            std::memset(&ox, 0, sizeof(TensorAccessPattern));
+            ox.allRequired = 0;
+            ox.noRmwAccess = 1;
+            ox.fullyWritten = 1;
+            ox.mapping[0] = {0, 1.0f, 0.0f, 0.0f, false};
+        }
+        uint32_t sp[] = {uint32_t(prm->valid_keys), uint32_t(k_pad), uint32_t(rows)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 3;
+        return copy_elf(out, qwen_expmax_bf16_start, qwen_expmax_bf16_end);
     }
     return GLUE_NODE_NOT_FOUND;
 }

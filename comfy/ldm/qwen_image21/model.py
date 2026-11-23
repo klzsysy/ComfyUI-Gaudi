@@ -174,21 +174,25 @@ class QwenImage21TransformerBlock(nn.Module):
         self.img_mlp = SwiGLUFeedForward(dim, dim * mlp_ratio, fused=fused_mlp, dtype=dtype, device=device, operations=operations)
 
     def _forward_with_prefix(self, x, mod, pe, pk, pv, options, pending):
-        if (options.get("hpu_fast_attention")
-                and x.device.type == "hpu" and x.dtype == torch.bfloat16 and pe.dtype == torch.float32
-                and x.shape[0] == 1 and x.shape[1] >= 4096 and self.attn.heads == 32 and x.shape[2] == 4096
-                and pk.shape == pv.shape and pk.shape[2:] == (32, 128) and pk.dtype == pv.dtype == x.dtype
-                and self.attn.comfy_attention.method is None
-                and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-                and not comfy.model_management.in_training and not comfy.model_management.args.disable_comfy_compiler
-                and "optimized_attention_override" not in options and not options.get("patches")
-                and not options.get("patches_replace") and not comfy.ops.has_forward_hooks(self)):
+        eligible = (x.device.type == "hpu" and x.dtype == torch.bfloat16 and pe.dtype == torch.float32
+                    and x.shape[0] == 1 and x.shape[1] >= 4096 and self.attn.heads == 32 and x.shape[2] == 4096
+                    and pk.shape == pv.shape and pk.shape[2:] == (32, 128) and pk.dtype == pv.dtype == x.dtype
+                    and self.attn.comfy_attention.method is None
+                    and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+                    and not comfy.model_management.in_training and not comfy.model_management.args.disable_comfy_compiler
+                    and "optimized_attention_override" not in options and not options.get("patches")
+                    and not options.get("patches_replace") and not comfy.ops.has_forward_hooks(self))
+        if eligible and options.get("hpu_fast_attention"):
             result = hpu.prefix_attention(self, x, mod, pe, pk, pv, options, attention, pending)
             if result is not None:
                 mid, normed, completed = result
                 output = _gated_residual(mid, self.img_mlp(normed), mod[3], 0)
                 completed.record()
                 pending.append(completed)
+                return output
+        elif eligible and options.get("hpu_bf16_rmw", True):
+            output = hpu.prefix_attention_bf16(self, x, mod, pe, pk, pv, options, pending)
+            if output is not None:
                 return output
         return self(x, mod, pe, prefix_cached_attention(pk, pv, options), 0, options)
 
@@ -539,6 +543,14 @@ class QwenImage21Transformer2DModel(nn.Module):
             prefix_states, hidden_states = hidden_states[:, :prefix_len], hidden_states[:, prefix_len:]
             prefix_pe, pe = pe[:, :prefix_len], pe[:, prefix_len:]
             prefix_len = 0
+        if (cache is not None and not transformer_options.get("hpu_fast_attention")
+                and transformer_options.get("hpu_bf16_rmw", True)
+                and hidden_states.device.type == "hpu" and hidden_states.dtype == torch.bfloat16
+                and pe.device == hidden_states.device and pe.dtype == torch.float32
+                and tuple(pe.shape) == (1, hidden_states.shape[1], 1, 64, 2, 2)
+                and hidden_states.shape[0] == 1 and hidden_states.shape[1] >= 4096
+                and hidden_states.shape[2] == 4096):
+            transformer_options["_qwen21_hpu_pe_cs"] = hpu.pack_pe_cs(pe)
 
         transformer_options["total_blocks"] = len(self.transformer_blocks)
         transformer_options["block_type"] = "single"

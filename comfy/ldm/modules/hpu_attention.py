@@ -3,6 +3,7 @@ from collections import OrderedDict, deque
 import ctypes as C
 from functools import lru_cache
 import hashlib
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -604,6 +605,178 @@ extern "C" void* build_rmw_fp8_expmax_plan(unsigned queries, unsigned keys, unsi
     }
 }
 
+extern "C" void* build_rmw_bf16_expmax_plan(unsigned queries, unsigned keys, unsigned k_head_stride_elems,
+                                            unsigned valid_keys, unsigned group_heads, unsigned tile,
+                                            unsigned slots, const char* recipe_name) {
+    try {
+        if (!queries || !keys || k_head_stride_elems < keys || !valid_keys || valid_keys > keys
+            || (keys % 128) != 0 || !group_heads || !tile || !slots) {
+            return nullptr;
+        }
+        const uint64_t score_bytes = ((uint64_t)keys * tile * 2 + 255ULL) & ~255ULL;
+        if (slots * score_bytes > 16ULL * 1024ULL * 1024ULL) return nullptr;
+        const uint64_t k_head_stride_bytes = (uint64_t)k_head_stride_elems * 128ULL * 2ULL;
+        const uint64_t stat_stride = ((uint64_t)queries * 4 + 127ULL) & ~127ULL;
+
+        auto plan = std::make_unique<RMWPlan>();
+        plan->group_heads = group_heads;
+        plan->head_strides[0] = (uint64_t)queries * 128 * 2;
+        plan->head_strides[1] = k_head_stride_bytes;
+        plan->head_strides[2] = k_head_stride_bytes;
+        plan->head_strides[3] = (uint64_t)queries * 128 * 2;
+        plan->head_strides[4] = stat_stride;
+        plan->head_strides[5] = stat_stride;
+
+        check(synGraphCreate(&plan->graph, synDeviceGaudi2), "graph_create");
+        std::vector<synSectionHandle> io;
+        for (int i = 0; i < 6; ++i) io.push_back(make_section(*plan, true, false));
+        // Single <=16 MiB RMW section shared in-place by S and P via inputsReusability -> 256B workspace, 0 EDMA.
+        synSectionHandle rmw_s = make_section(*plan, false, true);
+
+        const unsigned tiles_per_head = (queries + tile - 1) / tile;
+        const unsigned nops = group_heads * tiles_per_head;
+        unsigned axis1 = 1;
+        unsigned axis0 = 0;
+
+        synTensor q_full = make_persistent(*plan, "q", 0, 0, 2, 128, queries * group_heads, 1, syn_type_bf16, io[0]);
+        synTensor o_full = make_persistent(*plan, "o", 3, 0, 2, 128, queries * group_heads, 1, syn_type_bf16, io[3]);
+
+        // Bind per-head K and V directly at k_head_stride_bytes so multi-block K Flash-RMW runs zero-copy.
+        std::vector<synTensor> k_heads(group_heads), v_heads(group_heads);
+        std::vector<synTensor> sum_heads(group_heads), max_heads(group_heads);
+        for (unsigned h = 0; h < group_heads; ++h) {
+            k_heads[h] = make_persistent(*plan, "k_h" + std::to_string(h), 1, h * k_head_stride_bytes,
+                                         2, 128, keys, 1, syn_type_bf16, io[1]);
+            v_heads[h] = make_persistent(*plan, "v_h" + std::to_string(h), 2, h * k_head_stride_bytes,
+                                         2, 128, keys, 1, syn_type_bf16, io[2]);
+            sum_heads[h] = make_persistent(*plan, "sum_h" + std::to_string(h), 4, h * stat_stride,
+                                           1, queries, 1, 1, syn_type_float, io[4]);
+            max_heads[h] = make_persistent(*plan, "max_h" + std::to_string(h), 5, h * stat_stride,
+                                           1, queries, 1, 1, syn_type_float, io[5]);
+        }
+
+        std::vector<synTensor> q_tiles(nops), o_tiles(nops), sum_tiles(nops), max_tiles(nops);
+        std::vector<unsigned> op_head(nops), op_rows(nops);
+        if (nops == 1) {
+            q_tiles[0] = q_full;
+            o_tiles[0] = o_full;
+            sum_tiles[0] = sum_heads[0];
+            max_tiles[0] = max_heads[0];
+            op_head[0] = 0;
+            op_rows[0] = queries;
+        } else {
+            unsigned op = 0;
+            for (unsigned h = 0; h < group_heads; ++h) {
+                for (unsigned start = 0; start < queries; start += tile, ++op) {
+                    unsigned rows = std::min(tile, queries - start);
+                    std::string suffix = std::to_string(op);
+                    q_tiles[op] = make_tensor(*plan, "q" + suffix, 2, 128, rows, 1, syn_type_bf16, nullptr, 0);
+                    o_tiles[op] = make_tensor(*plan, "o" + suffix, 2, 128, rows, 1, syn_type_bf16, nullptr, 0);
+                    sum_tiles[op] = (tiles_per_head == 1)
+                        ? sum_heads[h]
+                        : make_tensor(*plan, "sum" + suffix, 1, rows, 1, 1, syn_type_float, nullptr, 0);
+                    max_tiles[op] = (tiles_per_head == 1)
+                        ? max_heads[h]
+                        : make_tensor(*plan, "max" + suffix, 1, rows, 1, 1, syn_type_float, nullptr, 0);
+                    op_head[op] = h;
+                    op_rows[op] = rows;
+                }
+            }
+            check(synNodeCreate(plan->graph, &q_full, q_tiles.data(), 1, nops, &axis1, sizeof(axis1),
+                                "split", "split_q", nullptr, nullptr), "split_q");
+            check(synNodeCreate(plan->graph, o_tiles.data(), &o_full, nops, 1, &axis1, sizeof(axis1),
+                                "concat", "concat_o", nullptr, nullptr), "concat_o");
+            if (tiles_per_head > 1) {
+                for (unsigned h = 0; h < group_heads; ++h) {
+                    check(synNodeCreate(plan->graph, &sum_tiles[h * tiles_per_head], &sum_heads[h],
+                                        tiles_per_head, 1, &axis0, sizeof(axis0),
+                                        "concat", ("concat_sum_" + std::to_string(h)).c_str(), nullptr, nullptr),
+                          "concat_sum");
+                    check(synNodeCreate(plan->graph, &max_tiles[h * tiles_per_head], &max_heads[h],
+                                        tiles_per_head, 1, &axis0, sizeof(axis0),
+                                        "concat", ("concat_max_" + std::to_string(h)).c_str(), nullptr, nullptr),
+                          "concat_max");
+                }
+            }
+        }
+
+        std::vector<synTensor> s_t(nops), p_t(nops);
+        for (unsigned i = 0; i < nops; ++i) {
+            unsigned rows = op_rows[i];
+            std::string suffix = std::to_string(i);
+            uint64_t off = (i % slots) * score_bytes;
+            s_t[i] = make_tensor(*plan, "s" + suffix, 2, keys, rows, 1, syn_type_bf16, rmw_s, off);
+            p_t[i] = make_tensor(*plan, "p" + suffix, 2, keys, rows, 1, syn_type_bf16, rmw_s, off);
+        }
+
+        synGEMMParams qk_params(false, true), av_params(false, false);
+        MossExpMaxParams em_params{static_cast<int32_t>(valid_keys)};
+        std::vector<synNodeId> qk_ids(nops), em_ids(nops), av_ids(nops);
+        auto emit_qk = [&](unsigned i) {
+            synTensor qk_in[] = {q_tiles[i], k_heads[op_head[i]]};
+            check(synNodeCreateWithId(plan->graph, qk_in, &s_t[i], 2, 1, &qk_params, sizeof(qk_params),
+                                      "gemm", ("qk" + std::to_string(i)).c_str(), &qk_ids[i], nullptr, nullptr), "qk");
+        };
+        auto emit_sp = [&](unsigned i) {
+            synTensor em_out[] = {p_t[i], sum_tiles[i], max_tiles[i]};
+            check(synNodeCreateWithId(plan->graph, &s_t[i], em_out, 1, 3, &em_params, sizeof(em_params),
+                                      "comfy_qwen_expmax_bf16", ("qwen_expmax_" + std::to_string(i)).c_str(),
+                                      &em_ids[i], nullptr, nullptr), "em");
+            synTensor av_in[] = {p_t[i], v_heads[op_head[i]]};
+            check(synNodeCreateWithId(plan->graph, av_in, &o_tiles[i], 2, 1, &av_params, sizeof(av_params),
+                                      "gemm", ("av" + std::to_string(i)).c_str(), &av_ids[i], nullptr, nullptr), "av");
+        };
+
+        if (slots >= 2 && nops >= 2) {
+            emit_qk(0);
+            for (unsigned i = 1; i < nops; ++i) {
+                emit_qk(i);
+                emit_sp(i - 1);
+            }
+            emit_sp(nops - 1);
+        } else {
+            for (unsigned i = 0; i < nops; ++i) {
+                emit_qk(i);
+                emit_sp(i);
+            }
+        }
+
+        for (unsigned i = 0; i < nops; ++i) {
+            if (i >= slots) {
+                check(synNodeDependencySet(plan->graph, &av_ids[i - slots], &qk_ids[i], 1, 1), "slot_reuse");
+            }
+            if (slots >= 2 && i >= 1) {
+                check(synNodeDependencySet(plan->graph, &qk_ids[i - 1], &qk_ids[i], 1, 1), "qk_order");
+                check(synNodeDependencySet(plan->graph, &qk_ids[i], &av_ids[i - 1], 1, 1), "qk_before_av");
+                check(synNodeDependencySet(plan->graph, &av_ids[i - 1], &av_ids[i], 1, 1), "av_order");
+            }
+        }
+
+        check(synGraphCompile(&plan->recipe, plan->graph, recipe_name, nullptr), "compile");
+        check(synWorkspaceGetSize(&plan->workspace, plan->recipe), "workspace");
+
+        std::vector<const char*> names;
+        std::vector<uint64_t> ids(plan->bindings.size());
+        for (const auto& b : plan->bindings) names.push_back(b.name.c_str());
+        check(synTensorRetrieveIds(plan->recipe, names.data(), ids.data(), ids.size()), "tensor_ids");
+        plan->launch_info.resize(plan->bindings.size());
+        for (size_t i = 0; i < plan->bindings.size(); ++i) {
+            plan->bindings[i].id = ids[i];
+            synLaunchTensorInfo info{};
+            info.tensorName = plan->bindings[i].name.c_str();
+            info.tensorId = ids[i];
+            info.tensorType = DATA_TENSOR;
+            for (unsigned d = 0; d < plan->bindings[i].dims; ++d) {
+                info.tensorSize[d] = plan->bindings[i].sizes[d];
+            }
+            plan->launch_info[i] = info;
+        }
+        return plan.release();
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+
 extern "C" uint64_t rmw_plan_workspace_bytes(void* handle) {
     return static_cast<RMWPlan*>(handle)->workspace;
 }
@@ -740,6 +913,10 @@ def _load_rmw_library():
         C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_char_p
     ]
     lib.build_rmw_fp8_expmax_plan.restype = C.c_void_p
+    lib.build_rmw_bf16_expmax_plan.argtypes = [
+        C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_char_p
+    ]
+    lib.build_rmw_bf16_expmax_plan.restype = C.c_void_p
     lib.rmw_plan_workspace_bytes.argtypes = [C.c_void_p]
     lib.rmw_plan_workspace_bytes.restype = C.c_uint64
     lib.launch_rmw_plan.argtypes = [
@@ -1215,8 +1392,234 @@ def rmw_fp8_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fallbac
     return _fp8_runtime().execute(q, k, v, fallback_fn)
 
 
+# Q/K scale matching comfy_qwen_expmax_bf16's exact 185.0f multiplier:
+# (q * scale) @ (k * scale)^T * 185.0 == (q @ k^T / sqrt(128)) * 128 * log2(e)
+BF16_EXPMAX_QK_SCALE = (128.0 ** -0.25) * math.sqrt(128.0 * math.log2(math.e) / 185.0)
+_BF16_EXPMAX_MAX_K_BLK = 10240
+
+
+def rmw_bf16_expmax_layout(kv_len: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
+    """Compute zero-copy K-block layout for pure-BF16 in-place RMW SRAM attention.
+
+    Keeps every K-block <= 10240 (512-aligned) so 2-slot 16 MiB RMW always achieves tile >= 384
+    across 1MP..8MP+ without high-resolution tile shrinkage or compile-time cliffs.
+    Returns (num_blocks, total_k_pad, ((offset_rows, valid_keys, kb_pad), ...)).
+    """
+    if kv_len <= 0:
+        raise ValueError(f"kv_len must be positive, got {kv_len}")
+    num_blocks = max(1, (kv_len + _BF16_EXPMAX_MAX_K_BLK - 1) // _BF16_EXPMAX_MAX_K_BLK)
+    k_blk = (((kv_len + num_blocks - 1) // num_blocks + 511) // 512) * 512
+    blocks = []
+    offset = 0
+    for b in range(num_blocks):
+        if offset >= kv_len:
+            break
+        end = min(kv_len, offset + k_blk)
+        valid_b = end - offset
+        kb_pad = max(512, ((valid_b + 511) // 512) * 512)
+        blocks.append((offset, valid_b, kb_pad))
+        offset += kb_pad
+    return len(blocks), offset, tuple(blocks)
+
+
+def _rmw_bf16_expmax_tile(queries: int, kb_pad: int, slots: int = 2) -> int | None:
+    if queries <= 0 or kb_pad <= 0 or (kb_pad % 128) != 0:
+        return None
+    max_tile = (16 * 1024 * 1024) // (slots * kb_pad * 2)
+    if max_tile >= 512:
+        tile = min(512, queries)
+    else:
+        tile = min((max_tile // 24) * 24, queries)
+    if tile <= 0:
+        return None
+    while tile > 24 and slots * (((kb_pad * tile * 2) + 255) & ~255) > 16 * 1024 * 1024:
+        tile -= 24
+    if slots * (((kb_pad * tile * 2) + 255) & ~255) > 16 * 1024 * 1024:
+        return None
+    return tile
+
+
+def rmw_bf16_expmax_supported(queries: int, keys: int, heads: int = 32) -> bool:
+    if queries <= 0 or keys <= 0 or heads <= 0:
+        return False
+    _, _, blocks = rmw_bf16_expmax_layout(keys)
+    return all(_rmw_bf16_expmax_tile(queries, kb_pad) is not None for _, _, kb_pad in blocks)
+
+
+def _bf16_merge_pair(
+    o0: torch.Tensor, s0: torch.Tensor, m0: torch.Tensor,
+    o1: torch.Tensor, s1: torch.Tensor, m1: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    queries = o0.shape[1]
+    s0 = s0[:, :queries]
+    m0 = m0[:, :queries]
+    s1 = s1[:, :queries]
+    m1 = m1[:, :queries]
+    m = torch.maximum(m0, m1)
+    w0 = torch.exp(m0 - m)
+    w1 = torch.exp(m1 - m)
+    s = w0 * s0 + w1 * s1
+    o = (o0.float() * w0.unsqueeze(-1) + o1.float() * w1.unsqueeze(-1)).to(o0.dtype)
+    return o, s, m
+
+
+@lru_cache(maxsize=1)
+def _compiled_bf16_merge_pair():
+    return torch.compile(_bf16_merge_pair, backend="hpu_backend", dynamic=None, options={"force_static_compile": True})
+
+
+class _RMWBF16ExpMaxRuntime:
+    def __init__(self, slots: int = 2, max_plans: int = 48):
+        from habana_frameworks.torch.utils import _debug_eager_C
+        from habana_frameworks.torch.utils.experimental import _compute_stream, _data_ptr
+
+        self._debug_eager_C = _debug_eager_C
+        self._compute_stream = _compute_stream
+        self._data_ptr = _data_ptr
+        self.lib = _load_rmw_library()
+        self.slots = slots
+        self.max_plans = max_plans
+        self.plans: OrderedDict[tuple, int] = OrderedDict()
+        self.ws: torch.Tensor | None = None
+        self.last_workspace: int = 0
+        self.last_num_blocks: int = 0
+        self._inflight = _InflightTracker(self.lib, max_inflight=2)
+
+    def _address(self, tensor: torch.Tensor) -> int:
+        return self._data_ptr(tensor) + tensor.storage_offset() * tensor.element_size()
+
+    def _ensure_ws(self, ws_bytes: int, device):
+        needed = max(256, int(ws_bytes))
+        if self.ws is None or self.ws.numel() < needed or self.ws.device != device:
+            self.ws = torch.empty(needed, dtype=torch.uint8, device=device)
+
+    @staticmethod
+    def _group_heads(heads: int, queries: int, tile: int) -> int:
+        tph = (queries + tile - 1) // tile
+        # Keep graph nops <= 80 so compile time stays < 0.6s even at 4MP..8MP+.
+        if (heads % 2) == 0 and tph <= 40:
+            return 2
+        return 1
+
+    def get_plan(self, queries: int, kb_pad: int, k_head_stride_elems: int, valid_keys: int, heads: int):
+        tile = _rmw_bf16_expmax_tile(queries, kb_pad, self.slots)
+        if tile is None:
+            return None
+        gh = self._group_heads(heads, queries, tile)
+        # Note: when gh == 1, head 0 has offset 0, but head_strides[1/2] still depends on k_head_stride_elems!
+        key = (queries, kb_pad, k_head_stride_elems, valid_keys, gh, tile)
+        plan = self.plans.get(key)
+        if plan is not None:
+            self.plans.move_to_end(key)
+            return plan
+        name = (
+            f"comfy_rmw_bf16_em_q{queries}_k{kb_pad}_ks{k_head_stride_elems}"
+            f"_v{valid_keys}_g{gh}_s{self.slots}_t{tile}"
+        )
+        plan = self.lib.build_rmw_bf16_expmax_plan(
+            queries, kb_pad, k_head_stride_elems, valid_keys, gh, tile, self.slots, name.encode("utf-8")
+        )
+        if not plan:
+            return None
+        while len(self.plans) >= self.max_plans:
+            _, evicted = self.plans.popitem(last=False)
+            self._inflight.drain()
+            torch.hpu.synchronize()
+            self.lib.destroy_rmw_plan(evicted)
+        self.plans[key] = plan
+        return plan
+
+    def execute_prepared(
+        self, qh: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, valid_kv: int
+    ) -> tuple | None:
+        heads, queries, head_dim = qh.shape
+        total_k_pad = kh.shape[1]
+        if head_dim != 128 or vh.shape != kh.shape:
+            return None
+        num_blocks, expected_k_pad, blocks = rmw_bf16_expmax_layout(int(valid_kv))
+        if total_k_pad < expected_k_pad:
+            return None
+        plans = []
+        max_ws = 256
+        for offset_rows, valid_b, kb_pad in blocks:
+            plan = self.get_plan(queries, kb_pad, total_k_pad, valid_b, heads)
+            if plan is None:
+                return None
+            max_ws = max(max_ws, int(self.lib.rmw_plan_workspace_bytes(plan)))
+            plans.append((plan, offset_rows))
+
+        self.last_workspace = max_ws
+        self.last_num_blocks = num_blocks
+        self._ensure_ws(max_ws, qh.device)
+
+        dev_id = int(qh.device.index or 0)
+        stat_stride = ((queries + 31) // 32) * 32
+        base_q = self._address(qh)
+        base_k = self._address(kh)
+        base_v = self._address(vh)
+        ws_addr = self._address(self.ws)
+
+        def launch_block(plan, offset_rows: int):
+            self._inflight.wait_for_slot()
+            out_b = torch.empty((heads, queries, 128), dtype=torch.bfloat16, device=qh.device)
+            sum_b = torch.empty((heads, stat_stride), dtype=torch.float32, device=qh.device)
+            max_b = torch.empty((heads, stat_stride), dtype=torch.float32, device=qh.device)
+            self._debug_eager_C.join_pending_pipeline_threads()
+            stream = self._compute_stream()
+            row_byte_off = offset_rows * 128 * 2
+            ptrs = (C.c_uint64 * 6)(
+                base_q,
+                base_k + row_byte_off,
+                base_v + row_byte_off,
+                self._address(out_b),
+                self._address(sum_b),
+                self._address(max_b),
+            )
+            st = self.lib.launch_rmw_plan(plan, stream, ptrs, ws_addr, heads)
+            if st != 0:
+                raise RuntimeError(f"launch_rmw_bf16_expmax_plan failed with synStatus={st}")
+            self._inflight.track(stream, dev_id, (qh, kh, vh, out_b, sum_b, max_b, self.ws))
+            return out_b, sum_b, max_b
+
+        if num_blocks == 1:
+            o0, s0, _ = launch_block(plans[0][0], plans[0][1])
+            return (o0, s0)
+
+        o_acc, s_acc, m_acc = launch_block(plans[0][0], plans[0][1])
+        if num_blocks == 2:
+            o1, s1, m1 = launch_block(plans[1][0], plans[1][1])
+            return (o_acc, s_acc, m_acc, o1, s1, m1)
+
+        # For 3+ K-blocks (5MP..16MP+), fold blocks 0..num_blocks-2 incrementally so peak buffer memory is O(1).
+        merge_pair = _compiled_bf16_merge_pair()
+        for plan, offset_rows in plans[1:-1]:
+            ob, sb, mb = launch_block(plan, offset_rows)
+            o_acc, s_acc, m_acc = merge_pair(o_acc, s_acc, m_acc, ob, sb, mb)
+        o_last, s_last, m_last = launch_block(plans[-1][0], plans[-1][1])
+        return (o_acc, s_acc, m_acc, o_last, s_last, m_last)
+
+
+@lru_cache(maxsize=1)
+def _bf16_expmax_runtime() -> _RMWBF16ExpMaxRuntime:
+    return _RMWBF16ExpMaxRuntime()
+
+
+@torch._dynamo.disable
+def rmw_bf16_expmax_attention_prepared(
+    qh: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, valid_kv: int
+) -> tuple:
+    res = _bf16_expmax_runtime().execute_prepared(qh, kh, vh, valid_kv)
+    if res is None:
+        raise RuntimeError(
+            f"RMW BF16 expmax attention plan unavailable for shapes q={tuple(qh.shape)} k={tuple(kh.shape)} valid={valid_kv}"
+        )
+    return res
+
+
 def release_inflight():
     if _runtime.cache_info().currsize:
         _runtime()._inflight.drain()
     if _fp8_runtime.cache_info().currsize:
         _fp8_runtime()._inflight.drain()
+    if _bf16_expmax_runtime.cache_info().currsize:
+        _bf16_expmax_runtime()._inflight.drain()
