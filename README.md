@@ -61,10 +61,10 @@ While other standard ComfyUI models that rely on generic PyTorch/BF16 operators 
 
 | Model / Family | Verified Precisions & Components | Key Gaudi2 Optimizations |
 | :--- | :--- | :--- |
-| **Qwen-Image-2.1 Turbo** | DiT: BF16 & native FP8 (`float8_e4m3fn`)<br>CLIP: Qwen3-VL 8B (BF16 / INT8 ConvRot / native FP8)<br>VAE: Qwen Image 2.1 VAE (BF16)<br>Prompt Enhancer: Qwen3.5 9B (BF16 / FP8 / FP8 + MTP) | Synapse RMW on-chip SRAM attention pipeline, aligned KV splits, fused FP8 DiT projections, HPU-safe VAE residual path, modular HPU MTP compilation, and 13 custom Gaudi2 TPC-C fused kernels with on-device batched speculative decoding |
-| **MOSS-Image** | **MOSS Image SFT** (BF16 DiT) & **Moody-Moss-Mix** (native FP8 DiT)<br>Text Encoder / `TextGenerate`: Qwen3.5 9B (BF16 / INT8 ConvRot / native FP8, with MTP)<br>VAE: Flux2 VAE | Native HPU FP8 Linear, fused FP8 block execution, long-sequence head-split & mixed FP8 attention, native norm/RoPE, static conditioning precomputation, and compiled GDN/KV decoding |
+| **Qwen-Image-2.1 Turbo** | DiT: BF16 & native FP8 (`float8_e4m3fn`)<br>CLIP: Qwen3-VL 8B (BF16 / INT8 ConvRot / native FP8)<br>VAE: Qwen Image 2.1 VAE (BF16)<br>Prompt Enhancer: Qwen3.5 9B (BF16 / FP8 / FP8 + MTP) | Pure-BF16 in-place RMW SRAM expmax attention (`comfy_qwen_expmax_bf16`, 0 B VLM / 256 B workspace) with zero-copy multi-block K Flash-RMW (`K_blk <= 10240`) and 3-stage compiled block fusion across 2MP–5MP+; FP8 RMW SRAM attention & fused projections; HPU-safe VAE residual path; modular HPU MTP compilation and 13 custom Qwen3.5 TPC-C kernels with on-device batched speculative decoding |
+| **MOSS-Image** | **MOSS Image SFT** (BF16 DiT) & **Moody-Moss-Mix** (native FP8 DiT)<br>Text Encoder / `TextGenerate`: Qwen3.5 9B (BF16 / INT8 ConvRot / native FP8, with MTP)<br>VAE: Flux2 VAE | 6 custom Gaudi2 MOSS FP8 TPC-C fused kernels (`comfy_moss_expmax_fp8` 16 KiB VLM double-row RMW SRAM attention, `moss_qkv_prep`, `moss_situ_quant`, `moss_res_adaln_quant`, `moss_hnd_scale_quant`, `moss_hnd_scale_sum_quant`), 0-graph-break FP8 block pipeline, native HPU FP8 Linear, `synEvent`-tracked RMW async lifetime, and compiled GDN/KV decoding |
 | **Krea 2** | `krea2_turbo_int8_convrot` DiT<br>CLIP: Qwen3-VL 4B FP8 (`qwen3vl_4b_fp8_scaled`)<br>VAE: Qwen Image VAE | CPU-semantic 256-entry E4M3FN weight decoding table to avoid Gaudi2 E4M3 range overflow |
-| **Qwen3.5 9B & Qwen3-VL Text Generation** | BF16, INT8 ConvRot, and native FP8 E4M3 (with optional MTP speculative decoding) | Compiled GDN prefill/decode, dynamic KV capacity reuse, HPU-safe sampling & boolean penalty masks, and custom TPC-C kernels for FP8 MTP decoding |
+| **Qwen3.5 9B & Qwen3-VL Text Generation** | BF16, INT8 ConvRot, and native FP8 E4M3 (with optional MTP speculative decoding) | Compiled GDN prefill/decode, dynamic KV capacity reuse, HPU-safe sampling & boolean penalty masks, and 13 custom TPC-C kernels for FP8 MTP decoding |
 
 Optional portable conversion tools for creating Gaudi2-safe native FP8 checkpoints are included under `scripts/gaudi/`:
 
@@ -89,8 +89,8 @@ git clone https://github.com/klzsysy/ComfyUI-Gaudi.git
 cd ComfyUI-Gaudi
 
 # Automatically discovers /opt/gaudi-install/venv-*, creates .venv linked via gaudi-base.pth,
-# installs ComfyUI Python dependencies without shadowing vendor Habana PyTorch,
-# and compiles the Gaudi2 Qwen3.5 TPC-C kernel library into build/hpu/.
+# installs ComfyUI Python dependencies (including ComfyUI-Manager) without shadowing vendor Habana PyTorch,
+# and compiles the 20-kernel Gaudi2 TPC-C library into build/hpu/.
 ./init-hpu.sh
 ```
 
@@ -131,7 +131,7 @@ PT_HPU_LAZY_MODE=0 GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so \
   bash scripts/gaudi/start.sh --listen 0.0.0.0 --port 8189
   ```
 
-  `scripts/gaudi/start.sh` always runs `.venv/bin/python main.py` with `PT_HPU_LAZY_MODE=0`, appends `build/hpu/libcomfy_qwen35_tpc.so` to `GC_KERNEL_PATH`, and passes the HPU-compatible ComfyUI flags (`--disable-dynamic-vram --disable-pinned-memory --disable-async-offload --disable-xformers --use-pytorch-cross-attention --disable-all-custom-nodes`). Set `COMFY_HPU_DISABLE_QWEN35_TPC=1` to explicitly fall back to PyTorch kernels for Qwen3.5 MTP.
+  `scripts/gaudi/start.sh` always runs `.venv/bin/python main.py` with `PT_HPU_LAZY_MODE=0`, appends `build/hpu/libcomfy_qwen35_tpc.so` to `GC_KERNEL_PATH`, exports `UV_CONFIG_FILE` (`uv.toml`) to protect vendor Habana PyTorch during ComfyUI-Manager package installs, and passes the HPU-compatible ComfyUI flags (`--disable-dynamic-vram --disable-pinned-memory --disable-async-offload --disable-xformers --use-pytorch-cross-attention --enable-manager`). Set `COMFY_HPU_DISABLE_QWEN35_TPC=1` to explicitly fall back to PyTorch kernels.
 
 ---
 
