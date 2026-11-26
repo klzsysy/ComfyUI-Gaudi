@@ -433,7 +433,7 @@ static habana::PartialOutputMetaDataVector meta_qwen_qk_rope_fp8(const at::Stack
     auto pk = s.at(2).toTensor();
     int64_t Q = q.size(0);
     int64_t P = pk.size(0);
-    int64_t k_pad = ((P + Q + 511) / 512) * 512;
+    int64_t k_pad = ((P + Q + 255) / 256) * 256;
     return {
         {at::kBFloat16, {32, Q, 128}},
         {at::kBFloat16, {32, k_pad, 128}},
@@ -459,7 +459,7 @@ static std::tuple<at::Tensor, at::Tensor> exec_qwen_qk_rope_fp8(
 static habana::PartialOutputMetaDataVector meta_qwen_v_quant_fp8(const at::Stack& s) {
     auto v = s.at(0).toTensor();
     auto pv = s.at(1).toTensor();
-    int64_t k_pad = ((pv.size(0) + v.size(0) + 511) / 512) * 512;
+    int64_t k_pad = ((pv.size(0) + v.size(0) + 255) / 256) * 256;
     return {{at::kFloat8_e4m3fn, {32, k_pad / 2, 256}}};
 }
 static std::shared_ptr<void> fill_qwen_v_quant_fp8(const at::Stack& s, size_t& size) {

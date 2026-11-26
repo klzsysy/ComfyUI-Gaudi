@@ -242,7 +242,7 @@ if available:
     @torch.library.register_fake("custom_op::comfy_qwen_qk_rope_fp8")
     def _fake_qwen_qk_rope_fp8(q, k, pk, qn_w, kn_w, pe_cs, chunks, eps, q_scale, k_scale):
         queries = q.shape[0]
-        k_pad = ((pk.shape[0] + queries + 511) // 512) * 512
+        k_pad = ((pk.shape[0] + queries + 255) // 256) * 256
         return (
             q.new_empty((32, queries, 128), dtype=torch.bfloat16),
             q.new_empty((32, k_pad, 128), dtype=torch.bfloat16),
@@ -250,7 +250,7 @@ if available:
 
     @torch.library.register_fake("custom_op::comfy_qwen_v_quant_fp8")
     def _fake_qwen_v_quant_fp8(v, pv, v_scales, chunks):
-        k_pad = ((pv.shape[0] + v.shape[0] + 511) // 512) * 512
+        k_pad = ((pv.shape[0] + v.shape[0] + 255) // 256) * 256
         return v.new_empty((32, k_pad // 2, 256), dtype=torch.float8_e4m3fn)
 
     @torch.library.register_fake("custom_op::comfy_qwen_hnd_scale_sum_quant")

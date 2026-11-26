@@ -357,7 +357,7 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId device, const ShapeInferenc
     if (!std::strcmp(name, "comfy_qwen_qk_rope_fp8")) {
         uint64_t Q = p->inputTensors[0]->geometry.maxSizes[1];
         uint64_t P = p->inputTensors[2]->geometry.maxSizes[2];
-        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        uint64_t k_pad = ((P + Q + 255) / 256) * 256;
         auto& o0 = out->outputTensors[0]->geometry;
         std::memset(&o0, 0, sizeof(TensorGeometry));
         o0.dims = 3; o0.dataType = DATA_BF16;
@@ -375,7 +375,7 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId device, const ShapeInferenc
     if (!std::strcmp(name, "comfy_qwen_v_quant_fp8")) {
         uint64_t Q = p->inputTensors[0]->geometry.maxSizes[1];
         uint64_t P = p->inputTensors[1]->geometry.maxSizes[2];
-        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        uint64_t k_pad = ((P + Q + 255) / 256) * 256;
         auto& o0 = out->outputTensors[0]->geometry;
         std::memset(&o0, 0, sizeof(TensorGeometry));
         o0.dims = 3; o0.dataType = DATA_F8_143;
@@ -946,7 +946,7 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
         auto& ia = out->inputTensorAccessPattern[0];
         std::memset(&ia, 0, sizeof(TensorAccessPattern));
         ia.allRequired = 0;
-        ia.fullyAccessedOnce = (k_pad <= 8704) ? 1 : 0;
+        ia.fullyAccessedOnce = (k_pad <= 14336) ? 1 : 0;
         ia.mapping[0] = {0, 0.0f, 0.0f, float(k_pad - 1), true};
         ia.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
         auto& o0 = out->outputTensorAccessPattern[0];
@@ -984,7 +984,7 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
             || pkg.maxSizes[0] != 128 || pkg.maxSizes[1] != 32 || peg.maxSizes[0] != 128 || peg.maxSizes[1] != Q
             || Q == 0 || P == 0)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
-        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        uint64_t k_pad = ((P + Q + 255) / 256) * 256;
         out->indexSpaceRank = 1;
         out->indexSpaceGeometry[0] = 32ULL * static_cast<uint64_t>(prm->chunks);
         out->auxiliaryTensorNr = 0;
@@ -1011,7 +1011,7 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
             || vg.maxSizes[0] != 4096 || pvg.maxSizes[0] != 128 || pvg.maxSizes[1] != 32
             || vsg.maxSizes[0] != 64 || vsg.maxSizes[1] != 32 || Q == 0 || P == 0)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
-        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        uint64_t k_pad = ((P + Q + 255) / 256) * 256;
         out->indexSpaceRank = 1;
         out->indexSpaceGeometry[0] = 32ULL * static_cast<uint64_t>(prm->chunks);
         out->auxiliaryTensorNr = 0;

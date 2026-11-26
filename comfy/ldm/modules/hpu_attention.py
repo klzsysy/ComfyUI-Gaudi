@@ -1794,23 +1794,24 @@ def rmw_bf16_expmax_attention_prepared(
     return res
 
 
-# Q scale matching comfy_qwen_expmax_fp8's direct u16-bias exp (K scale = 1.0):
-# (q * QWEN_FP8_EXPMAX_Q_SCALE) @ k^T == (q @ k^T / sqrt(128)) * 128 * log2(e)
-QWEN_FP8_EXPMAX_Q_SCALE = (128.0 * math.log2(math.e)) / math.sqrt(128.0)
-_QWEN_FP8_EXPMAX_MAX_K_BLK = 10240
+# Q scale matching comfy_qwen_expmax_fp8's direct u8 FP8 bit-encoding exp (K scale = 1.0):
+# (q * QWEN_FP8_EXPMAX_Q_SCALE) @ k^T == (q @ k^T / sqrt(128)) * 8 * log2(e)
+QWEN_FP8_EXPMAX_Q_SCALE = (8.0 * math.log2(math.e)) / math.sqrt(128.0)
+_QWEN_FP8_EXPMAX_MAX_K_BLK = 14336
 
 
 def rmw_qwen_fp8_expmax_layout(kv_len: int) -> tuple[int, int, tuple[tuple[int, int, int], ...]]:
     """Compute zero-copy K-block layout for Qwen FP8 P*V RMW SRAM attention.
 
-    Keeps every K-block <= 10240 (512-aligned, matching both 256-row all_lanes V_fp8 blocks and
-    qwen_expmax_fp8 fast paths) so 2-slot 16 MiB RMW always achieves tile >= 384 across 1MP..8MP+.
+    Keeps every K-block <= 14336 (256-aligned, matching both 256-row all_lanes V_fp8 blocks and
+    qwen_expmax_fp8's 27 KiB single-read VLM fast path) so 1MP..3MP run in 1 block, 4MP..5MP run
+    in 2 blocks, and 2-slot 16 MiB RMW always achieves tile >= 288.
     Returns (num_blocks, total_k_pad, ((offset_rows, valid_keys, kb_pad), ...)).
     """
     if kv_len <= 0:
         raise ValueError(f"kv_len must be positive, got {kv_len}")
     num_blocks = max(1, (kv_len + _QWEN_FP8_EXPMAX_MAX_K_BLK - 1) // _QWEN_FP8_EXPMAX_MAX_K_BLK)
-    k_blk = (((kv_len + num_blocks - 1) // num_blocks + 511) // 512) * 512
+    k_blk = (((kv_len + num_blocks - 1) // num_blocks + 255) // 256) * 256
     blocks = []
     offset = 0
     for _ in range(num_blocks):
@@ -1818,7 +1819,7 @@ def rmw_qwen_fp8_expmax_layout(kv_len: int) -> tuple[int, int, tuple[tuple[int, 
             break
         end = min(kv_len, offset + k_blk)
         valid_b = end - offset
-        kb_pad = max(512, ((valid_b + 511) // 512) * 512)
+        kb_pad = max(256, ((valid_b + 255) // 256) * 256)
         blocks.append((offset, valid_b, kb_pad))
         offset += kb_pad
     return len(blocks), offset, tuple(blocks)

@@ -36,41 +36,45 @@ def hpu_fp8_env(monkeypatch):
     "kv_len,expected_blocks",
     [
         (1, 1),
+        (256, 1),
         (512, 1),
         (4096, 1),
+        (5246, 1),
         (8607, 1),
         (9310, 1),
-        (10240, 1),
-        (10241, 2),
-        (12731, 2),
-        (13434, 2),
+        (12731, 1),
+        (13390, 1),
+        (14336, 1),
+        (14337, 2),
         (16767, 2),
         (17470, 2),
-        (20480, 2),
-        (20481, 3),
-        (21587, 3),
+        (20847, 2),
+        (21550, 2),
+        (28672, 2),
+        (28673, 3),
         (30720, 3),
-        (30721, 4),
+        (43008, 3),
+        (43009, 4),
     ],
 )
 def test_qwen_fp8_expmax_layout_invariants(kv_len, expected_blocks):
     num_blocks, total_k_pad, blocks = hpu_attention.rmw_qwen_fp8_expmax_layout(kv_len)
     assert num_blocks == expected_blocks
     assert len(blocks) == expected_blocks
-    assert total_k_pad == ((kv_len + 511) // 512) * 512
-    assert 0 <= total_k_pad - kv_len <= 511
+    assert total_k_pad == ((kv_len + 255) // 256) * 256
+    assert 0 <= total_k_pad - kv_len <= 255
     assert sum(valid_b for _, valid_b, _ in blocks) == kv_len
     offset = 0
     for idx, (off, valid_b, kb_pad) in enumerate(blocks):
         assert off == offset
-        assert 1 <= valid_b <= kb_pad <= 10240
-        assert kb_pad % 512 == 0
+        assert 1 <= valid_b <= kb_pad <= 14336
+        assert kb_pad % 256 == 0
         if idx < len(blocks) - 1:
             assert valid_b == kb_pad
         else:
-            assert 0 <= kb_pad - valid_b <= 511
+            assert 0 <= kb_pad - valid_b <= 255
         tile = hpu_attention._rmw_qwen_fp8_expmax_tile(4096, kb_pad)
-        assert tile is not None and tile >= 384
+        assert tile is not None and tile >= 288
         offset += kb_pad
     assert offset == total_k_pad
     assert hpu_attention.rmw_qwen_fp8_expmax_supported(4096, kv_len, 32)
@@ -101,7 +105,7 @@ def test_qwen_fp8_tpc_kernels_accuracy(hpu_fp8_env):
     torch.manual_seed(2026)
     queries, prefix = 1025, 311
     kv_len = queries + prefix
-    k_pad = ((kv_len + 511) // 512) * 512
+    k_pad = ((kv_len + 255) // 256) * 256
 
     q_raw = (torch.randn((queries, 4096), dtype=torch.bfloat16) * 0.7).to("hpu")
     k_raw = (torch.randn((queries, 4096), dtype=torch.bfloat16) * 0.7).to("hpu")
@@ -165,11 +169,13 @@ def test_qwen_fp8_tpc_kernels_accuracy(hpu_fp8_env):
 @pytest.mark.parametrize(
     "heads,queries,kv_len,expected_blocks,shift_second_half",
     [
-        (8, 4096, 5000, 1, False),
-        (8, 4096, 9310, 1, False),
-        (8, 4100, 11500, 2, False),
-        (8, 4100, 11500, 2, True),
-        (4, 4100, 21500, 3, True),
+        (8, 4096, 5000, 1, False),    # 5120 (tail_512)
+        (8, 4096, 5246, 1, False),    # 5376 (tail_256)
+        (8, 4096, 9310, 1, False),    # 9472 (2MP pos, tail_256, 27K VLM)
+        (8, 4096, 13390, 1, False),   # 13568 (3MP pos, 1-block, tail_256, 27K VLM)
+        (8, 4100, 15000, 2, False),   # 2-block (7680 + 7424, tail_256)
+        (8, 4100, 15000, 2, True),    # 2-block cross-block max shift
+        (4, 4100, 29000, 3, True),    # 3-block incremental merge
     ],
 )
 def test_qwen_fp8_expmax_attention_accuracy_and_multiblock(
@@ -296,10 +302,11 @@ def _make_block_inputs(queries, prefix_len, seed=202):
 @pytest.mark.parametrize(
     "queries,prefix_len",
     [
-        (4096, 512),   # pad_len == 0 (B_k = 1)
-        (4096, 511),   # pad_len == 1 (B_k = 1, supported natively!)
-        (4096, 447),   # pad_len > 1  (B_k = 1)
-        (4100, 6500),  # non-32-multiple Q + B_k = 2 (_fp8_v2_post2)
+        (4096, 256),    # pad_len == 0 on 256-boundary (B_k = 1)
+        (4096, 255),    # pad_len == 1 on 256-boundary (B_k = 1, supported natively!)
+        (4096, 512),    # pad_len == 0 on 512-boundary (B_k = 1)
+        (4096, 447),    # pad_len > 1  (B_k = 1)
+        (4100, 10500),  # non-32-multiple Q + B_k = 2 (_fp8_v2_post2)
     ],
 )
 def test_qwen21_fp8_block_matches_baseline(hpu_fp8_env, queries, prefix_len):
