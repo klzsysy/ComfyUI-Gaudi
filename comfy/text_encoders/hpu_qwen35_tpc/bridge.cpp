@@ -408,6 +408,108 @@ static at::Tensor exec_vae_dupup2d_add(
     return op.execute({x, main_t, c_out, mode, has_main})[0];
 }
 
+static habana::PartialOutputMetaDataVector meta_qwen_expmax_fp8(const at::Stack& s) {
+    auto scores = s.at(0).toTensor();
+    return {
+        {at::kFloat8_e4m3fn, {scores.size(0), scores.size(1)}},
+        {at::kFloat, {scores.size(0)}},
+        {at::kFloat, {scores.size(0)}},
+    };
+}
+static std::shared_ptr<void> fill_qwen_expmax_fp8(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(MossExpMaxParams);
+    params->valid_keys = static_cast<int32_t>(s.at(1).toInt());
+    return params;
+}
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> exec_qwen_expmax_fp8(
+    const at::Tensor& scores, int64_t valid_keys) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_qwen_expmax_fp8");
+    auto r = op.execute({scores, valid_keys});
+    return {r[0], r[1], r[2]};
+}
+
+static habana::PartialOutputMetaDataVector meta_qwen_qk_rope_fp8(const at::Stack& s) {
+    auto q = s.at(0).toTensor();
+    auto pk = s.at(2).toTensor();
+    int64_t Q = q.size(0);
+    int64_t P = pk.size(0);
+    int64_t k_pad = ((P + Q + 511) / 512) * 512;
+    return {
+        {at::kBFloat16, {32, Q, 128}},
+        {at::kBFloat16, {32, k_pad, 128}},
+    };
+}
+static std::shared_ptr<void> fill_qwen_qk_rope_fp8(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(QwenQkRopeParams);
+    params->chunks = static_cast<int32_t>(s.at(6).toInt());
+    params->eps = static_cast<float>(s.at(7).toDouble());
+    params->q_scale = static_cast<float>(s.at(8).toDouble());
+    params->k_scale = static_cast<float>(s.at(9).toDouble());
+    return params;
+}
+static std::tuple<at::Tensor, at::Tensor> exec_qwen_qk_rope_fp8(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& pk,
+    const at::Tensor& qn_w, const at::Tensor& kn_w, const at::Tensor& pe_cs,
+    int64_t chunks, double eps, double q_scale, double k_scale) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_qwen_qk_rope_fp8");
+    auto r = op.execute({q, k, pk, qn_w, kn_w, pe_cs, chunks, eps, q_scale, k_scale});
+    return {r[0], r[1]};
+}
+
+static habana::PartialOutputMetaDataVector meta_qwen_v_quant_fp8(const at::Stack& s) {
+    auto v = s.at(0).toTensor();
+    auto pv = s.at(1).toTensor();
+    int64_t k_pad = ((pv.size(0) + v.size(0) + 511) / 512) * 512;
+    return {{at::kFloat8_e4m3fn, {32, k_pad / 2, 256}}};
+}
+static std::shared_ptr<void> fill_qwen_v_quant_fp8(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(QwenVQuantParams);
+    params->chunks = static_cast<int32_t>(s.at(3).toInt());
+    return params;
+}
+static at::Tensor exec_qwen_v_quant_fp8(
+    const at::Tensor& v, const at::Tensor& pv, const at::Tensor& v_scales, int64_t chunks) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_qwen_v_quant_fp8");
+    return op.execute({v, pv, v_scales, chunks})[0];
+}
+
+static habana::PartialOutputMetaDataVector meta_qwen_hnd_scale_sum_q(const at::Stack& s) {
+    auto a = s.at(0).toTensor();
+    return {
+        {at::kFloat8_e4m3fn, {a.size(1), 4096}},
+        {at::kFloat, {a.size(1)}},
+    };
+}
+static std::tuple<at::Tensor, at::Tensor> exec_qwen_hnd_scale_sum_q(
+    const at::Tensor& attn, const at::Tensor& scales, const at::Tensor& sum_in) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_qwen_hnd_scale_sum_quant");
+    auto r = op.execute({attn, scales, sum_in});
+    return {r[0], r[1]};
+}
+
+static habana::PartialOutputMetaDataVector meta_qwen_res_adaln_q(const at::Stack& s) {
+    auto x = s.at(0).toTensor();
+    int64_t has_res = s.at(4).toInt();
+    return {
+        {at::kBFloat16, has_res ? std::vector<int64_t>{x.size(0), x.size(1)} : std::vector<int64_t>{1, 1}},
+        {at::kFloat8_e4m3fn, {x.size(0), x.size(1)}},
+        {at::kFloat, {x.size(0)}},
+    };
+}
+static std::shared_ptr<void> fill_qwen_res_adaln_q(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(QwenResAdalnParams);
+    params->has_res = static_cast<int32_t>(s.at(4).toInt());
+    params->eps = static_cast<float>(s.at(5).toDouble());
+    return params;
+}
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> exec_qwen_res_adaln_q(
+    const at::Tensor& x, const at::Tensor& res, const at::Tensor& gate, const at::Tensor& scale_p1,
+    int64_t has_res, double eps) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_qwen_res_adaln_quant");
+    auto r = op.execute({x, res, gate, scale_p1, has_res, eps});
+    return {r[0], r[1], r[2]};
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
     lib.def("comfy_qwen35_topk_s1(Tensor logits, Tensor pen_mask, Tensor anc_toks, int has_pen, float pres_pen, float rep_pen) -> Tensor");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen35_topk_s1", "comfy_topk_s1_bmax", meta_topk_s1, fill_topk_s1);
@@ -471,6 +573,21 @@ TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
 
     lib.def("comfy_vae_dupup2d_add_bf16(Tensor x, Tensor main_t, int c_out, int mode, int has_main) -> Tensor");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_vae_dupup2d_add_bf16", "comfy_vae_dupup2d_add_bf16", meta_vae_dupup2d_add, fill_vae_dupup2d_add);
+
+    lib.def("comfy_qwen_expmax_fp8(Tensor scores, int valid_keys) -> (Tensor, Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen_expmax_fp8", "comfy_qwen_expmax_fp8", meta_qwen_expmax_fp8, fill_qwen_expmax_fp8);
+
+    lib.def("comfy_qwen_qk_rope_fp8(Tensor q, Tensor k, Tensor pk, Tensor qn_w, Tensor kn_w, Tensor pe_cs, int chunks, float eps, float q_scale, float k_scale) -> (Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen_qk_rope_fp8", "comfy_qwen_qk_rope_fp8", meta_qwen_qk_rope_fp8, fill_qwen_qk_rope_fp8);
+
+    lib.def("comfy_qwen_v_quant_fp8(Tensor v, Tensor pv, Tensor v_scales, int chunks) -> Tensor");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen_v_quant_fp8", "comfy_qwen_v_quant_fp8", meta_qwen_v_quant_fp8, fill_qwen_v_quant_fp8);
+
+    lib.def("comfy_qwen_hnd_scale_sum_quant(Tensor attn, Tensor scales, Tensor sum_in) -> (Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen_hnd_scale_sum_quant", "comfy_qwen_hnd_scale_sum_quant_fp8", meta_qwen_hnd_scale_sum_q, nullptr);
+
+    lib.def("comfy_qwen_res_adaln_quant(Tensor x, Tensor res, Tensor gate, Tensor scale_p1, int has_res, float eps) -> (Tensor, Tensor, Tensor)");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen_res_adaln_quant", "comfy_qwen_res_adaln_quant_fp8", meta_qwen_res_adaln_q, fill_qwen_res_adaln_q);
 }
 
 TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
@@ -495,4 +612,9 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
     lib.impl("comfy_moss_expmax_fp8", exec_moss_expmax_fp8);
     lib.impl("comfy_vae_rmsnorm_silu_bf16", exec_vae_rmsnorm_silu);
     lib.impl("comfy_vae_dupup2d_add_bf16", exec_vae_dupup2d_add);
+    lib.impl("comfy_qwen_expmax_fp8", exec_qwen_expmax_fp8);
+    lib.impl("comfy_qwen_qk_rope_fp8", exec_qwen_qk_rope_fp8);
+    lib.impl("comfy_qwen_v_quant_fp8", exec_qwen_v_quant_fp8);
+    lib.impl("comfy_qwen_hnd_scale_sum_quant", exec_qwen_hnd_scale_sum_q);
+    lib.impl("comfy_qwen_res_adaln_quant", exec_qwen_res_adaln_q);
 }

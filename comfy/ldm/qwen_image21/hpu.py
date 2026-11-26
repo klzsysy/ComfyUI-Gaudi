@@ -201,6 +201,156 @@ def pack_pe_cs(pe: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return cos, sin
 
 
+def pack_pe_cs_fp8(pe: torch.Tensor) -> torch.Tensor:
+    # Pack [1, Q, 1, 64, 2, 2] rotation table into [Q, 128] FP32 ([cos64, sin64]) for qwen_qk_rope_fp8.
+    return torch.cat((pe[0, :, 0, :, 0, 0], pe[0, :, 0, :, 1, 0]), dim=-1).contiguous()
+
+
+def _fp8_v2_pre(x, scale1, norm1_eps, wq, sq, wk, sk, wv, sv, pk, pv, nq, nk, qk_eps, pe_cs):
+    sp1 = (1.0 + scale1[0, 0]).contiguous()
+    x0 = x[0].contiguous()
+    _, qi, sc = _hpu_tpc.qwen_res_adaln_quant(x0, x0, sp1, sp1, 0, norm1_eps)
+    sc2 = sc.unsqueeze(-1)
+    qr = torch.ops.hpu.fp8_gemm_v2(qi, False, wq, True, None, torch.bfloat16, sc2, sq, None, False)
+    kr = torch.ops.hpu.fp8_gemm_v2(qi, False, wk, True, None, torch.bfloat16, sc2, sk, None, False)
+    pk0 = pk[0].contiguous()
+    pv0 = pv[0].contiguous()
+    qh, kh = _hpu_tpc.qwen_qk_rope_fp8(
+        qr, kr, pk0, nq.contiguous(), nk.contiguous(), pe_cs,
+        3, qk_eps, hpu_attention.QWEN_FP8_EXPMAX_Q_SCALE, 1.0,
+    )
+    vr = torch.ops.hpu.fp8_gemm_v2(qi, False, wv, True, None, torch.bfloat16, sc2, sv, None, False)
+    vm_p = pv0.abs().amax(dim=(0, 2))
+    vm_v = vr.view(vr.shape[0], 32, 128).abs().amax(dim=(0, 2))
+    v_scales = (torch.maximum(vm_p, vm_v).float().clamp_min(1e-12) / 240.0).unsqueeze(-1).expand(32, 64).contiguous()
+    vh_q = _hpu_tpc.qwen_v_quant_fp8(vr, pv0, v_scales, 3)
+    return qh, kh, vh_q, v_scales
+
+
+def _fp8_v2_post1(x, attn_out, v_scales, sum_out, gate1, scale2, gate2, norm2_eps, wo, so, wgu, sgu, wout, sout):
+    g1 = gate1[0, 0].contiguous()
+    sp2 = (1.0 + scale2[0, 0]).contiguous()
+    g2 = gate2[0, 0].contiguous()
+    oq, os_ = _hpu_tpc.qwen_hnd_scale_sum_quant(attn_out, v_scales, sum_out)
+    po = torch.ops.hpu.fp8_gemm_v2(oq, False, wo, True, None, torch.bfloat16, os_.unsqueeze(-1), so, None, False)
+    mid, q2, s2 = _hpu_tpc.qwen_res_adaln_quant(x[0].contiguous(), po, g1, sp2, 1, norm2_eps)
+    gu = torch.ops.hpu.fp8_gemm_v2(q2, False, wgu, True, None, torch.bfloat16, s2.unsqueeze(-1), sgu, None, False)
+    g_, u_ = gu.chunk(2, dim=-1)
+    act = F.silu(g_) * u_
+    s3 = act.abs().amax(-1, keepdim=True).float().clamp_min(1e-12) / 240.0
+    q3 = torch.ops.hpu.cast_to_fp8_v2(act, s3.reciprocal(), False, False, torch.float8_e4m3fn)[0]
+    fo = torch.ops.hpu.fp8_gemm_v2(q3, False, wout, True, None, torch.bfloat16, s3, sout, None, False)
+    return torch.addcmul(mid, fo, g2).unsqueeze(0)
+
+
+def _fp8_v2_post2(x, o0, s0, m0, o1, s1, m1, v_scales, gate1, scale2, gate2, norm2_eps, wo, so, wgu, sgu, wout, sout):
+    queries = o0.shape[1]
+    s0 = s0[:, :queries]
+    m0 = m0[:, :queries]
+    s1 = s1[:, :queries]
+    m1 = m1[:, :queries]
+    mm = torch.maximum(m0, m1)
+    w0 = torch.exp(m0 - mm)
+    w1 = torch.exp(m1 - mm)
+    s_merged = (w0 * s0 + w1 * s1).contiguous()
+    o_merged = (o0.float() * w0.unsqueeze(-1) + o1.float() * w1.unsqueeze(-1)).to(o0.dtype).contiguous()
+    return _fp8_v2_post1(
+        x, o_merged, v_scales, s_merged, gate1, scale2, gate2, norm2_eps, wo, so, wgu, sgu, wout, sout
+    )
+
+
+@lru_cache(maxsize=1)
+def _fp8_v2_regions():
+    opts = {"force_static_compile": True}
+    return tuple(
+        torch.compile(fn, backend="hpu_backend", dynamic=None, options=opts)
+        for fn in (_fp8_v2_pre, _fp8_v2_post1, _fp8_v2_post2)
+    )
+
+
+def prefix_attention_fp8(block, x, mod, pe, pk, pv, options, pending):
+    if _hpu_tpc is None or not _hpu_tpc.available:
+        return None
+    if pk.shape[0] != 1 or pk.shape[1] < 2 or len(mod) != 5:
+        return None
+    queries = int(x.shape[1])
+    if pe.device != x.device or tuple(pe.shape) != (1, queries, 1, 64, 2, 2):
+        return None
+    attn = block.attn
+    mlp = block.img_mlp
+    if not getattr(mlp, "fused", False) or attn.norm_q.eps != attn.norm_k.eps:
+        return None
+    if getattr(attn.norm_q, "weight_function", None) or getattr(attn.norm_k, "weight_function", None):
+        return None
+    attn_projs = (attn.to_q, attn.to_k, attn.to_v, attn.to_out[0])
+    mlp_projs = (mlp.gate_up, mlp.out)
+    if not all(_dynamic_fp8(layer) for layer in (*attn_projs, *mlp_projs)):
+        return None
+    if (any(tuple(layer.weight.shape) != (4096, 4096) for layer in attn_projs)
+            or mlp.gate_up.weight.shape[1] != 4096 or mlp.out.weight.shape[0] != 4096
+            or mlp.gate_up.weight.shape[0] != 2 * mlp.out.weight.shape[1]):
+        return None
+    kv_len = int(pk.shape[1]) + queries
+    if not hpu_attention.rmw_qwen_fp8_expmax_supported(queries, kv_len, 32):
+        return None
+
+    # Bound in-flight block allocations to keep peak VRAM flat even at 4MP/5MP+.
+    if len(pending) == 2:
+        completed = pending.pop(0)
+        completed.synchronize()
+    else:
+        completed = torch.hpu.Event()
+
+    pre_fn, post1_fn, post2_fn = _fp8_v2_regions()
+    scale1, gate1, scale2, gate2, _ = mod
+    pe_cs = options.get("_qwen21_hpu_pe_cs_fp8")
+    if pe_cs is None:
+        pe_cs = pack_pe_cs_fp8(pe)
+
+    with contextlib.ExitStack() as stack:
+        qkv_weights = []
+        for linear in (attn.to_q, attn.to_k, attn.to_v):
+            weight, _ = stack.enter_context(comfy.ops.CastBiasWeightContext(
+                linear, x, dtype=linear.weight.dtype, bias_dtype=x.dtype, compute_dtype=x.dtype,
+                offloadable=True, want_requant=True))
+            qkv_weights.extend((weight._qdata, weight._params.scale))
+        norms = [
+            stack.enter_context(comfy.ops.CastBiasWeightContext(norm, x, offloadable=True))[0]
+            for norm in (attn.norm_q, attn.norm_k)
+        ]
+        torch._dynamo.mark_dynamic(pk, 1)
+        torch._dynamo.mark_dynamic(pv, 1)
+        qh, kh, vh_q256, v_scales = pre_fn(
+            x, scale1[1], float(block.img_norm1.eps),
+            *qkv_weights, pk, pv, norms[0], norms[1], float(attn.norm_q.eps), pe_cs,
+        )
+        vh_fp8 = vh_q256.view(32, kh.shape[1], 128)
+        attn_res = hpu_attention.rmw_qwen_fp8_expmax_attention_prepared(qh, kh, vh_fp8, kv_len)
+
+    with contextlib.ExitStack() as stack:
+        post_weights = []
+        for linear in (attn.to_out[0], mlp.gate_up, mlp.out):
+            weight, _ = stack.enter_context(comfy.ops.CastBiasWeightContext(
+                linear, x, dtype=linear.weight.dtype, bias_dtype=x.dtype, compute_dtype=x.dtype,
+                offloadable=True, want_requant=True))
+            post_weights.extend((weight._qdata, weight._params.scale))
+        if len(attn_res) == 2:
+            o0, s0 = attn_res
+            output = post1_fn(
+                x, o0, v_scales, s0, gate1[1], scale2[1], gate2[1], float(block.img_norm2.eps), *post_weights
+            )
+        else:
+            o0, s0, m0, o1, s1, m1 = attn_res
+            output = post2_fn(
+                x, o0, s0, m0, o1, s1, m1, v_scales, gate1[1], scale2[1], gate2[1],
+                float(block.img_norm2.eps), *post_weights,
+            )
+
+    completed.record()
+    pending.append(completed)
+    return output
+
+
 def prefix_attention_bf16(block, x, mod, pe, pk, pv, options, pending):
     if _hpu_tpc is None or not _hpu_tpc.available:
         return None

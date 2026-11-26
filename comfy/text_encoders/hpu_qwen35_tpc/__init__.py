@@ -231,6 +231,45 @@ if available:
     def _fake_vae_dupup2d_add_bf16(x, main_t, c_out, mode, has_main):
         return x.new_empty((x.shape[0], c_out, x.shape[2] * 2, x.shape[3] * 2), dtype=torch.bfloat16)
 
+    @torch.library.register_fake("custom_op::comfy_qwen_expmax_fp8")
+    def _fake_qwen_expmax_fp8(scores, valid_keys):
+        return (
+            scores.new_empty(scores.shape, dtype=torch.float8_e4m3fn),
+            scores.new_empty((scores.shape[0],), dtype=torch.float32),
+            scores.new_empty((scores.shape[0],), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_qwen_qk_rope_fp8")
+    def _fake_qwen_qk_rope_fp8(q, k, pk, qn_w, kn_w, pe_cs, chunks, eps, q_scale, k_scale):
+        queries = q.shape[0]
+        k_pad = ((pk.shape[0] + queries + 511) // 512) * 512
+        return (
+            q.new_empty((32, queries, 128), dtype=torch.bfloat16),
+            q.new_empty((32, k_pad, 128), dtype=torch.bfloat16),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_qwen_v_quant_fp8")
+    def _fake_qwen_v_quant_fp8(v, pv, v_scales, chunks):
+        k_pad = ((pv.shape[0] + v.shape[0] + 511) // 512) * 512
+        return v.new_empty((32, k_pad // 2, 256), dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake("custom_op::comfy_qwen_hnd_scale_sum_quant")
+    def _fake_qwen_hnd_scale_sum_quant(attn, scales, sum_in):
+        rows = attn.shape[1]
+        return (
+            attn.new_empty((rows, 4096), dtype=torch.float8_e4m3fn),
+            attn.new_empty((rows,), dtype=torch.float32),
+        )
+
+    @torch.library.register_fake("custom_op::comfy_qwen_res_adaln_quant")
+    def _fake_qwen_res_adaln_quant(x, res, gate, scale_p1, has_res, eps):
+        ox = torch.empty_like(x) if has_res else x.new_empty((1, 1))
+        return (
+            ox,
+            x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+            x.new_empty((x.shape[0],), dtype=torch.float32),
+        )
+
 
 def topk(logits, pen_mask, anc_toks, k, has_pen, pres_pen, rep_pen):
     bmax = torch.ops.custom_op.comfy_qwen35_topk_s1(logits, pen_mask, anc_toks, has_pen, pres_pen, rep_pen)
@@ -325,3 +364,23 @@ def vae_dupup2d_add_bf16(x, main_t, c_out, mode, has_main):
     else:
         m4 = main_t
     return torch.ops.custom_op.comfy_vae_dupup2d_add_bf16(x4, m4, c_out, mode, has_main)
+
+
+def qwen_expmax_fp8(scores, valid_keys):
+    return torch.ops.custom_op.comfy_qwen_expmax_fp8(scores, valid_keys)
+
+
+def qwen_qk_rope_fp8(q, k, pk, qn_w, kn_w, pe_cs, chunks, eps, q_scale, k_scale):
+    return torch.ops.custom_op.comfy_qwen_qk_rope_fp8(q, k, pk, qn_w, kn_w, pe_cs, chunks, eps, q_scale, k_scale)
+
+
+def qwen_v_quant_fp8(v, pv, v_scales, chunks):
+    return torch.ops.custom_op.comfy_qwen_v_quant_fp8(v, pv, v_scales, chunks)
+
+
+def qwen_hnd_scale_sum_quant(attn, scales, sum_in):
+    return torch.ops.custom_op.comfy_qwen_hnd_scale_sum_quant(attn, scales, sum_in)
+
+
+def qwen_res_adaln_quant(x, res, gate, scale_p1, has_res, eps):
+    return torch.ops.custom_op.comfy_qwen_res_adaln_quant(x, res, gate, scale_p1, has_res, eps)

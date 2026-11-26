@@ -183,6 +183,10 @@ class QwenImage21TransformerBlock(nn.Module):
                     and "optimized_attention_override" not in options and not options.get("patches")
                     and not options.get("patches_replace") and not comfy.ops.has_forward_hooks(self))
         if eligible and options.get("hpu_fast_attention"):
+            if options.get("hpu_fp8_rmw", True):
+                output = hpu.prefix_attention_fp8(self, x, mod, pe, pk, pv, options, pending)
+                if output is not None:
+                    return output
             result = hpu.prefix_attention(self, x, mod, pe, pk, pv, options, attention, pending)
             if result is not None:
                 mid, normed, completed = result
@@ -543,14 +547,16 @@ class QwenImage21Transformer2DModel(nn.Module):
             prefix_states, hidden_states = hidden_states[:, :prefix_len], hidden_states[:, prefix_len:]
             prefix_pe, pe = pe[:, :prefix_len], pe[:, prefix_len:]
             prefix_len = 0
-        if (cache is not None and not transformer_options.get("hpu_fast_attention")
-                and transformer_options.get("hpu_bf16_rmw", True)
+        if (cache is not None
                 and hidden_states.device.type == "hpu" and hidden_states.dtype == torch.bfloat16
                 and pe.device == hidden_states.device and pe.dtype == torch.float32
                 and tuple(pe.shape) == (1, hidden_states.shape[1], 1, 64, 2, 2)
                 and hidden_states.shape[0] == 1 and hidden_states.shape[1] >= 4096
                 and hidden_states.shape[2] == 4096):
-            transformer_options["_qwen21_hpu_pe_cs"] = hpu.pack_pe_cs(pe)
+            if transformer_options.get("hpu_fast_attention") and transformer_options.get("hpu_fp8_rmw", True):
+                transformer_options["_qwen21_hpu_pe_cs_fp8"] = hpu.pack_pe_cs_fp8(pe)
+            elif not transformer_options.get("hpu_fast_attention") and transformer_options.get("hpu_bf16_rmw", True):
+                transformer_options["_qwen21_hpu_pe_cs"] = hpu.pack_pe_cs(pe)
 
         transformer_options["total_blocks"] = len(self.transformer_blocks)
         transformer_options["block_type"] = "single"

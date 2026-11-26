@@ -25,6 +25,11 @@ extern "C" const unsigned char moss_hnd_scale_q_start[], moss_hnd_scale_q_end[];
 extern "C" const unsigned char moss_hnd_scale_sum_q_start[], moss_hnd_scale_sum_q_end[];
 extern "C" const unsigned char moss_expmax_fp8_start[], moss_expmax_fp8_end[];
 extern "C" const unsigned char qwen_expmax_bf16_start[], qwen_expmax_bf16_end[];
+extern "C" const unsigned char qwen_expmax_fp8_start[], qwen_expmax_fp8_end[];
+extern "C" const unsigned char qwen_qk_rope_fp8_start[], qwen_qk_rope_fp8_end[];
+extern "C" const unsigned char qwen_v_quant_fp8_start[], qwen_v_quant_fp8_end[];
+extern "C" const unsigned char qwen_hnd_scale_sum_q_start[], qwen_hnd_scale_sum_q_end[];
+extern "C" const unsigned char qwen_res_adaln_q_start[], qwen_res_adaln_q_end[];
 extern "C" const unsigned char vae_rmsnorm_silu_bf16_start[], vae_rmsnorm_silu_bf16_end[];
 extern "C" const unsigned char vae_dupup2d_add_bf16_start[], vae_dupup2d_add_bf16_end[];
 
@@ -49,6 +54,11 @@ static const char* const kGuids[] = {
     "comfy_moss_hnd_scale_sum_quant_fp8",
     "comfy_moss_expmax_fp8",
     "comfy_qwen_expmax_bf16",
+    "comfy_qwen_expmax_fp8",
+    "comfy_qwen_qk_rope_fp8",
+    "comfy_qwen_v_quant_fp8",
+    "comfy_qwen_hnd_scale_sum_quant_fp8",
+    "comfy_qwen_res_adaln_quant_fp8",
     "comfy_vae_rmsnorm_silu_bf16",
     "comfy_vae_dupup2d_add_bf16",
 };
@@ -330,6 +340,78 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId device, const ShapeInferenc
             ox.dims = 1; ox.dataType = DATA_F32;
             ox.maxSizes[0] = ox.minSizes[0] = sg.maxSizes[1];
         }
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_expmax_fp8")) {
+        const auto& sg = p->inputTensors[0]->geometry;
+        auto& o0 = out->outputTensors[0]->geometry;
+        o0 = sg; o0.dataType = DATA_F8_143;
+        for (int oi = 1; oi <= 2; ++oi) {
+            auto& ox = out->outputTensors[oi]->geometry;
+            std::memset(&ox, 0, sizeof(TensorGeometry));
+            ox.dims = 1; ox.dataType = DATA_F32;
+            ox.maxSizes[0] = ox.minSizes[0] = sg.maxSizes[1];
+        }
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_qk_rope_fp8")) {
+        uint64_t Q = p->inputTensors[0]->geometry.maxSizes[1];
+        uint64_t P = p->inputTensors[2]->geometry.maxSizes[2];
+        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        auto& o0 = out->outputTensors[0]->geometry;
+        std::memset(&o0, 0, sizeof(TensorGeometry));
+        o0.dims = 3; o0.dataType = DATA_BF16;
+        o0.maxSizes[0] = o0.minSizes[0] = 128;
+        o0.maxSizes[1] = o0.minSizes[1] = Q;
+        o0.maxSizes[2] = o0.minSizes[2] = 32;
+        auto& o1 = out->outputTensors[1]->geometry;
+        std::memset(&o1, 0, sizeof(TensorGeometry));
+        o1.dims = 3; o1.dataType = DATA_BF16;
+        o1.maxSizes[0] = o1.minSizes[0] = 128;
+        o1.maxSizes[1] = o1.minSizes[1] = k_pad;
+        o1.maxSizes[2] = o1.minSizes[2] = 32;
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_v_quant_fp8")) {
+        uint64_t Q = p->inputTensors[0]->geometry.maxSizes[1];
+        uint64_t P = p->inputTensors[1]->geometry.maxSizes[2];
+        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        auto& o0 = out->outputTensors[0]->geometry;
+        std::memset(&o0, 0, sizeof(TensorGeometry));
+        o0.dims = 3; o0.dataType = DATA_F8_143;
+        o0.maxSizes[0] = o0.minSizes[0] = 256;
+        o0.maxSizes[1] = o0.minSizes[1] = k_pad / 2;
+        o0.maxSizes[2] = o0.minSizes[2] = 32;
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_hnd_scale_sum_quant_fp8")) {
+        uint64_t rows = p->inputTensors[0]->geometry.maxSizes[1];
+        auto& o0 = out->outputTensors[0]->geometry;
+        std::memset(&o0, 0, sizeof(TensorGeometry));
+        o0.dims = 2; o0.dataType = DATA_F8_143;
+        o0.maxSizes[0] = o0.minSizes[0] = 4096;
+        o0.maxSizes[1] = o0.minSizes[1] = rows;
+        auto& o1 = out->outputTensors[1]->geometry;
+        std::memset(&o1, 0, sizeof(TensorGeometry));
+        o1.dims = 1; o1.dataType = DATA_F32;
+        o1.maxSizes[0] = o1.minSizes[0] = rows;
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_qwen_res_adaln_quant_fp8")) {
+        const auto& xg = p->inputTensors[0]->geometry;
+        const auto* prm = static_cast<const QwenResAdalnParams*>(p->nodeParams.nodeParams);
+        auto& o0 = out->outputTensors[0]->geometry;
+        o0 = xg;
+        if (!prm || !prm->has_res) {
+            o0.maxSizes[0] = o0.minSizes[0] = 1;
+            o0.maxSizes[1] = o0.minSizes[1] = 1;
+        }
+        auto& o1 = out->outputTensors[1]->geometry;
+        o1 = xg; o1.dataType = DATA_F8_143;
+        auto& o2 = out->outputTensors[2]->geometry;
+        std::memset(&o2, 0, sizeof(TensorGeometry));
+        o2.dims = 1; o2.dataType = DATA_F32;
+        o2.maxSizes[0] = o2.minSizes[0] = xg.maxSizes[1];
         return GLUE_SUCCESS;
     }
     if (!std::strcmp(name, "comfy_vae_rmsnorm_silu_bf16")) {
@@ -847,6 +929,205 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
         std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
         out->kernel.paramsNr = 3;
         return copy_elf(out, qwen_expmax_bf16_start, qwen_expmax_bf16_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_expmax_fp8")) {
+        if (p->inputTensorNr != 1 || p->outputTensorNr != 3) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const MossExpMaxParams*>(p->nodeParams.nodeParams);
+        const auto& sg = p->inputTensors[0].geometry;
+        uint64_t k_pad = sg.maxSizes[0];
+        uint64_t rows = sg.maxSizes[1];
+        if (sg.dims != 2 || sg.dataType != DATA_BF16 || k_pad < 256 || (k_pad % 256) != 0 || rows == 0
+            || !prm || prm->valid_keys <= 0 || static_cast<uint64_t>(prm->valid_keys) > k_pad)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = rows;
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        auto& ia = out->inputTensorAccessPattern[0];
+        std::memset(&ia, 0, sizeof(TensorAccessPattern));
+        ia.allRequired = 0;
+        ia.fullyAccessedOnce = (k_pad <= 8704) ? 1 : 0;
+        ia.mapping[0] = {0, 0.0f, 0.0f, float(k_pad - 1), true};
+        ia.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        auto& o0 = out->outputTensorAccessPattern[0];
+        std::memset(&o0, 0, sizeof(TensorAccessPattern));
+        o0.allRequired = 0;
+        o0.noRmwAccess = 1;
+        o0.fullyWritten = 1;
+        o0.mapping[0] = {0, 0.0f, 0.0f, float(k_pad - 1), true};
+        o0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        for (int oi = 1; oi <= 2; ++oi) {
+            auto& ox = out->outputTensorAccessPattern[oi];
+            std::memset(&ox, 0, sizeof(TensorAccessPattern));
+            ox.allRequired = 0;
+            ox.noRmwAccess = 1;
+            ox.fullyWritten = 1;
+            ox.mapping[0] = {0, 1.0f, 0.0f, 0.0f, false};
+        }
+        uint32_t sp[] = {uint32_t(prm->valid_keys), uint32_t(k_pad), uint32_t(rows)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 3;
+        return copy_elf(out, qwen_expmax_fp8_start, qwen_expmax_fp8_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_qk_rope_fp8")) {
+        if (p->inputTensorNr != 6 || p->outputTensorNr != 2) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const QwenQkRopeParams*>(p->nodeParams.nodeParams);
+        const auto& qg = p->inputTensors[0].geometry;
+        const auto& kg = p->inputTensors[1].geometry;
+        const auto& pkg = p->inputTensors[2].geometry;
+        const auto& peg = p->inputTensors[5].geometry;
+        uint64_t Q = qg.maxSizes[1];
+        uint64_t P = pkg.maxSizes[2];
+        if (!prm || prm->chunks <= 0 || qg.dims != 2 || kg.dims != 2 || pkg.dims != 3 || peg.dims != 2
+            || qg.dataType != DATA_BF16 || kg.dataType != DATA_BF16 || pkg.dataType != DATA_BF16 || peg.dataType != DATA_F32
+            || qg.maxSizes[0] != 4096 || kg.maxSizes[0] != 4096 || kg.maxSizes[1] != Q
+            || pkg.maxSizes[0] != 128 || pkg.maxSizes[1] != 32 || peg.maxSizes[0] != 128 || peg.maxSizes[1] != Q
+            || Q == 0 || P == 0)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = 32ULL * static_cast<uint64_t>(prm->chunks);
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        set_all_required(out, 6, 2);
+        out->outputTensorAccessPattern[0].fullyWritten = 1;
+        out->outputTensorAccessPattern[1].fullyWritten = 1;
+        uint32_t sp[] = {uint32_t(Q), uint32_t(P), uint32_t(k_pad), uint32_t(prm->chunks),
+                         f2u(prm->eps), f2u(prm->q_scale), f2u(prm->k_scale)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 7;
+        return copy_elf(out, qwen_qk_rope_fp8_start, qwen_qk_rope_fp8_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_v_quant_fp8")) {
+        if (p->inputTensorNr != 3 || p->outputTensorNr != 1) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const QwenVQuantParams*>(p->nodeParams.nodeParams);
+        const auto& vg = p->inputTensors[0].geometry;
+        const auto& pvg = p->inputTensors[1].geometry;
+        const auto& vsg = p->inputTensors[2].geometry;
+        uint64_t Q = vg.maxSizes[1];
+        uint64_t P = pvg.maxSizes[2];
+        if (!prm || prm->chunks <= 0 || vg.dims != 2 || pvg.dims != 3 || vsg.dims != 2
+            || vg.dataType != DATA_BF16 || pvg.dataType != DATA_BF16 || vsg.dataType != DATA_F32
+            || vg.maxSizes[0] != 4096 || pvg.maxSizes[0] != 128 || pvg.maxSizes[1] != 32
+            || vsg.maxSizes[0] != 64 || vsg.maxSizes[1] != 32 || Q == 0 || P == 0)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t k_pad = ((P + Q + 511) / 512) * 512;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = 32ULL * static_cast<uint64_t>(prm->chunks);
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        set_all_required(out, 3, 1);
+        out->outputTensorAccessPattern[0].fullyWritten = 1;
+        uint32_t sp[] = {uint32_t(Q), uint32_t(P), uint32_t(k_pad), uint32_t(prm->chunks)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 4;
+        return copy_elf(out, qwen_v_quant_fp8_start, qwen_v_quant_fp8_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_hnd_scale_sum_quant_fp8")) {
+        if (p->inputTensorNr != 3 || p->outputTensorNr != 2) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto& ag = p->inputTensors[0].geometry;
+        const auto& hg = p->inputTensors[1].geometry;
+        const auto& sg = p->inputTensors[2].geometry;
+        uint64_t rows = ag.maxSizes[1];
+        if (ag.dims != 3 || ag.dataType != DATA_BF16 || ag.maxSizes[0] != 128 || ag.maxSizes[2] != 32 || rows == 0)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (hg.dims != 2 || hg.dataType != DATA_F32 || hg.maxSizes[0] != 64 || hg.maxSizes[1] != 32)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (sg.dims != 2 || sg.dataType != DATA_F32 || sg.maxSizes[0] < rows || sg.maxSizes[1] != 32)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = rows;
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        auto& ia0 = out->inputTensorAccessPattern[0];
+        std::memset(&ia0, 0, sizeof(TensorAccessPattern));
+        ia0.allRequired = 0;
+        ia0.fullyAccessedOnce = 1;
+        ia0.mapping[0] = {0, 0.0f, 0.0f, 127.0f, true};
+        ia0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        ia0.mapping[2] = {0, 0.0f, 0.0f, 31.0f, true};
+        std::memset(&out->inputTensorAccessPattern[1], 0, sizeof(TensorAccessPattern));
+        out->inputTensorAccessPattern[1].allRequired = 1;
+        std::memset(&out->inputTensorAccessPattern[2], 0, sizeof(TensorAccessPattern));
+        out->inputTensorAccessPattern[2].allRequired = 1;
+        auto& o0 = out->outputTensorAccessPattern[0];
+        std::memset(&o0, 0, sizeof(TensorAccessPattern));
+        o0.allRequired = 0;
+        o0.noRmwAccess = 1;
+        o0.fullyWritten = 1;
+        o0.mapping[0] = {0, 0.0f, 0.0f, 4095.0f, true};
+        o0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        auto& o1 = out->outputTensorAccessPattern[1];
+        std::memset(&o1, 0, sizeof(TensorAccessPattern));
+        o1.allRequired = 0;
+        o1.noRmwAccess = 1;
+        o1.fullyWritten = 1;
+        o1.mapping[0] = {0, 1.0f, 0.0f, 0.0f, false};
+        uint32_t sp[] = {uint32_t(rows)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 1;
+        return copy_elf(out, qwen_hnd_scale_sum_q_start, qwen_hnd_scale_sum_q_end);
+    }
+    if (!std::strcmp(name, "comfy_qwen_res_adaln_quant_fp8")) {
+        if (p->inputTensorNr != 4 || p->outputTensorNr != 3) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const QwenResAdalnParams*>(p->nodeParams.nodeParams);
+        const auto& xg = p->inputTensors[0].geometry;
+        uint64_t dim = xg.maxSizes[0];
+        uint64_t rows = xg.maxSizes[1];
+        if (!prm || xg.dims != 2 || xg.dataType != DATA_BF16 || dim == 0 || (dim % 256) != 0 || dim > 4096 || rows == 0)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = rows;
+        out->auxiliaryTensorNr = 0;
+        out->preferredSplitDim = 0;
+        auto& ia0 = out->inputTensorAccessPattern[0];
+        std::memset(&ia0, 0, sizeof(TensorAccessPattern));
+        ia0.allRequired = 0;
+        ia0.fullyAccessedOnce = 1;
+        ia0.mapping[0] = {0, 0.0f, 0.0f, float(dim - 1), true};
+        ia0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        auto& ia1 = out->inputTensorAccessPattern[1];
+        std::memset(&ia1, 0, sizeof(TensorAccessPattern));
+        if (prm->has_res) {
+            ia1.allRequired = 0;
+            ia1.fullyAccessedOnce = 1;
+            ia1.mapping[0] = {0, 0.0f, 0.0f, float(dim - 1), true};
+            ia1.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        } else {
+            ia1.allRequired = 1;
+        }
+        for (int i = 2; i < 4; ++i) {
+            std::memset(&out->inputTensorAccessPattern[i], 0, sizeof(TensorAccessPattern));
+            out->inputTensorAccessPattern[i].allRequired = 1;
+        }
+        auto& o0 = out->outputTensorAccessPattern[0];
+        std::memset(&o0, 0, sizeof(TensorAccessPattern));
+        o0.noRmwAccess = 1;
+        if (prm->has_res) {
+            o0.allRequired = 0;
+            o0.fullyWritten = 1;
+            o0.mapping[0] = {0, 0.0f, 0.0f, float(dim - 1), true};
+            o0.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        } else {
+            o0.allRequired = 1;
+        }
+        auto& o1 = out->outputTensorAccessPattern[1];
+        std::memset(&o1, 0, sizeof(TensorAccessPattern));
+        o1.allRequired = 0;
+        o1.noRmwAccess = 1;
+        o1.fullyWritten = 1;
+        o1.mapping[0] = {0, 0.0f, 0.0f, float(dim - 1), true};
+        o1.mapping[1] = {0, 1.0f, 0.0f, 0.0f, false};
+        auto& o2 = out->outputTensorAccessPattern[2];
+        std::memset(&o2, 0, sizeof(TensorAccessPattern));
+        o2.allRequired = 0;
+        o2.noRmwAccess = 1;
+        o2.fullyWritten = 1;
+        o2.mapping[0] = {0, 1.0f, 0.0f, 0.0f, false};
+        uint32_t sp[] = {uint32_t(dim), uint32_t(rows), uint32_t(prm->has_res), f2u(1.0f / float(dim)), f2u(prm->eps)};
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 5;
+        return copy_elf(out, qwen_res_adaln_q_start, qwen_res_adaln_q_end);
     }
     if (!std::strcmp(name, "comfy_vae_rmsnorm_silu_bf16")) {
         if (p->inputTensorNr != 2 || p->outputTensorNr != 1) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;

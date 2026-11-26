@@ -90,3 +90,19 @@ struct VaeDupUp2dAddParams {
     int32_t mode;
     int32_t has_main;
 };
+
+struct QwenQkRopeParams {
+    int32_t chunks;
+    float eps;
+    float q_scale;
+    float k_scale;
+};
+
+struct QwenVQuantParams {
+    int32_t chunks;
+};
+
+struct QwenResAdalnParams {
+    int32_t has_res;
+    float eps;
+};

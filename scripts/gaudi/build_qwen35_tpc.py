@@ -38,6 +38,11 @@ KERNELS = (
     ("moss_hnd_scale_sum_q", "moss_hnd_scale_sum_quant.c"),
     ("moss_expmax_fp8", "moss_expmax_fp8.c"),
     ("qwen_expmax_bf16", "qwen_expmax_bf16.c"),
+    ("qwen_expmax_fp8", "qwen_expmax_fp8.c"),
+    ("qwen_qk_rope_fp8", "qwen_qk_rope_fp8.c"),
+    ("qwen_v_quant_fp8", "qwen_v_quant_fp8.c"),
+    ("qwen_hnd_scale_sum_q", "qwen_hnd_scale_sum_quant.c"),
+    ("qwen_res_adaln_q", "qwen_res_adaln_quant.c"),
     ("vae_rmsnorm_silu_bf16", "vae_rmsnorm_silu_bf16.c"),
     ("vae_dupup2d_add_bf16", "vae_dupup2d_add_bf16.c"),
 )
