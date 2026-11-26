@@ -11,7 +11,49 @@ from .vae import AttentionBlock, CausalConv3d, RMS_norm
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
+try:
+    from comfy.text_encoders import hpu_qwen35_tpc as _hpu_tpc
+except Exception:
+    _hpu_tpc = None
+
 CACHE_T = 2
+
+
+def _has_hooks(module: nn.Module) -> bool:
+    return bool(module._forward_hooks or module._forward_pre_hooks or module._backward_hooks)
+
+
+def _hpu_tpc_ready(x: torch.Tensor) -> bool:
+    return (
+        _hpu_tpc is not None
+        and _hpu_tpc.available
+        and not torch.is_grad_enabled()
+        and x.device.type == "hpu"
+        and x.dtype == torch.bfloat16
+    )
+
+
+def _hpu_gamma_1d(norm: RMS_norm, device: torch.device) -> torch.Tensor:
+    g = norm.gamma.view(-1)
+    if g.device != device or g.dtype != torch.bfloat16:
+        g = g.to(device=device, dtype=torch.bfloat16)
+    return g
+
+
+def _hpu_dummy_4d(device: torch.device) -> torch.Tensor:
+    return torch.empty((1, 1, 1, 1), dtype=torch.bfloat16, device=device)
+
+
+def _is_eligible_rms_silu_pair(norm: nn.Module, act: nn.Module) -> bool:
+    return (
+        isinstance(norm, RMS_norm)
+        and norm.channel_first
+        and norm.bias is None
+        and not norm.training
+        and not _has_hooks(norm)
+        and isinstance(act, nn.SiLU)
+        and not _has_hooks(act)
+    )
 
 
 class Resample(nn.Module):
@@ -173,6 +215,56 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is None:
+            if (
+                x.shape[2] == 1
+                and _hpu_tpc_ready(x)
+                and not self.training
+                and not _has_hooks(self.residual)
+                and len(self.residual) == 7
+                and _is_eligible_rms_silu_pair(self.residual[0], self.residual[1])
+                and _is_eligible_rms_silu_pair(self.residual[3], self.residual[4])
+                and isinstance(self.residual[5], nn.Dropout)
+                and not self.residual[5].training
+                and not _has_hooks(self.residual[5])
+            ):
+                norm0, _, conv0, norm1, _, _, conv1 = self.residual
+                xc = x if x.is_contiguous() else x.contiguous()
+                b_sz, c_in, _, h_full, w_full = xc.shape
+                x_flat = xc.view(b_sz, c_in, h_full * w_full)
+                g0 = _hpu_gamma_1d(norm0, xc.device)
+                g1 = _hpu_gamma_1d(norm1, xc.device)
+                n = -(-xc.numel() // STRIP_ELEMS)
+                if n <= 1:
+                    h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                        x_flat, g0, 0, h_full * w_full, 1, float(norm0.scale))
+                    h = conv0(h.view(b_sz, c_in, 1, h_full, w_full))
+                    c_out = h.shape[1]
+                    h_flat = (h if h.is_contiguous() else h.contiguous()).view(b_sz, c_out, h_full * w_full)
+                    h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                        h_flat, g1, 0, h_full * w_full, 1, float(norm1.scale))
+                    h = conv1(h.view(b_sz, c_out, 1, h_full, w_full))
+                    return h + self.shortcut(xc)
+                step = -(-h_full // n)
+                out = None
+                for a in range(0, h_full, step):
+                    b = min(h_full, a + step)
+                    lo = max(0, a - 2)
+                    hi = min(h_full, b + 2)
+                    lo1 = max(0, a - 1)
+                    hi1 = min(h_full, b + 1)
+                    h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                        x_flat, g0, lo * w_full, (hi - lo) * w_full, 1, float(norm0.scale))
+                    h = conv0(h.view(b_sz, c_in, 1, hi - lo, w_full))
+                    c_out = h.shape[1]
+                    h_flat = (h if h.is_contiguous() else h.contiguous()).view(b_sz, c_out, (hi - lo) * w_full)
+                    h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                        h_flat, g1, (lo1 - lo) * w_full, (hi1 - lo1) * w_full, 1, float(norm1.scale))
+                    h = conv1(h.view(b_sz, c_out, 1, hi1 - lo1, w_full))
+                    y = h.narrow(-2, a - lo1, b - a) + self.shortcut(xc.narrow(-2, a, b - a))
+                    if out is None:
+                        out = y.new_empty(*y.shape[:-2], h_full, w_full)
+                    out.narrow(-2, a, b - a).copy_(y)
+                return out
             # single image: the whole block runs in strips so its intermediates never exist at full size
             return strip_apply(lambda s: self.residual(s).add_(self.shortcut(s)), x, halo=2)
         old_x = x
@@ -254,6 +346,35 @@ class AvgDown3D(nn.Module):
         self.group_size = in_channels * self.factor // out_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C_in, T, H, W = x.shape
+        C_out = self.out_channels
+        ft = self.factor_t
+        fs = self.factor_s
+        g = self.group_size
+        s2 = fs * fs
+
+        if self.factor == 1 and C_in == C_out:
+            return x
+        if ft == 1 and g == s2 and fs > 1:
+            y = F.avg_pool2d(
+                x.reshape(B * C_in * T, 1, H, W) if T > 1 else x.squeeze(2),
+                kernel_size=fs,
+                stride=fs,
+            )
+            return y.reshape(B, C_out, T, H // fs, W // fs)
+        if ft == 1 and g == fs and fs > 1:
+            y = x.reshape(B, C_in, T, H // fs, fs, W // fs, fs).mean(dim=-1)
+            if T == 1:
+                return y.squeeze(2).permute(0, 1, 3, 2, 4).reshape(B, C_out, 1, H // fs, W // fs)
+            return y.permute(0, 1, 4, 2, 3, 5).reshape(B, C_out, T, H // fs, W // fs)
+        if T == 1 and ft == 2 and g == s2 and fs > 1:
+            pooled = F.avg_pool2d(x.squeeze(2), kernel_size=fs, stride=fs)
+            out = torch.zeros((B, C_in, 2, H // fs, W // fs), dtype=pooled.dtype, device=pooled.device)
+            out[:, :, 1] = pooled
+            return out.reshape(B, C_out, 1, H // fs, W // fs)
+        if T == 1 and ft == 2 and g == 2 * s2 and fs > 1:
+            return (F.avg_pool2d(x.squeeze(2), kernel_size=fs, stride=fs) * 0.5).unsqueeze(2)
+
         pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
         pad = (0, 0, 0, 0, pad_t, 0)
         x = F.pad(x, pad)
@@ -308,7 +429,87 @@ class DupUp3D(nn.Module):
         assert out_channels * self.factor % in_channels == 0
         self.repeats = out_channels * self.factor // in_channels
 
+    def _hpu_dupup2d_mode(self) -> int:
+        if self.factor_s != 2:
+            return -1
+        if self.in_channels == self.out_channels and self.factor_t in (1, 2):
+            return 0
+        if self.in_channels == 2 * self.out_channels and self.factor_t == 2:
+            return 1
+        if self.in_channels == 2 * self.out_channels and self.factor_t == 1:
+            return 2
+        if self.in_channels == 4 * self.out_channels and self.factor_t == 2:
+            return 3
+        return -1
+
     def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
+        B, C_in, T, H, W = x.shape
+        C_out = self.out_channels
+        ft = self.factor_t
+        fs = self.factor_s
+        repeats = self.repeats
+        s2 = fs * fs
+
+        if first_chunk and T == 1 and _hpu_tpc_ready(x) and not self.training:
+            mode = self._hpu_dupup2d_mode()
+            if mode >= 0:
+                return _hpu_tpc.vae_dupup2d_add_bf16(
+                    x.squeeze(2), _hpu_dummy_4d(x.device), C_out, mode, 0
+                ).unsqueeze(2)
+
+        if repeats % s2 == 0:
+            r_t = repeats // s2
+            if ft == 1:
+                k = r_t
+                y = x if k == 1 else x.repeat_interleave(k, dim=1)
+                if fs == 1:
+                    return y
+                y4 = y.reshape(B, C_out * T, H, W)
+                y4 = F.interpolate(y4, scale_factor=float(fs), mode="nearest-exact")
+                return y4.reshape(B, C_out, T, H * fs, W * fs)
+            if first_chunk and T == 1:
+                if ft % r_t == 0:
+                    step = ft // r_t
+                    y = x[:, step - 1::step, 0]
+                elif r_t % ft == 0:
+                    k = r_t // ft
+                    y = x[:, :, 0] if k == 1 else x[:, :, 0].repeat_interleave(k, dim=1)
+                else:
+                    idx = torch.tensor([(c * ft + (ft - 1)) // r_t for c in range(C_out)], device=x.device)
+                    y = x.index_select(1, idx).squeeze(2)
+                if fs > 1:
+                    y = F.interpolate(y, scale_factor=float(fs), mode="nearest-exact")
+                return y.unsqueeze(2)
+            if r_t == 1:
+                y = x.reshape(B, C_out, ft, T, H, W).permute(0, 1, 3, 2, 4, 5).reshape(B, C_out, T * ft, H, W)
+            elif r_t == ft:
+                y = x.repeat_interleave(ft, dim=2)
+            else:
+                y = (
+                    x.repeat_interleave(r_t, dim=1)
+                    .reshape(B, C_out, ft, T, H, W)
+                    .permute(0, 1, 3, 2, 4, 5)
+                    .reshape(B, C_out, T * ft, H, W)
+                )
+            if first_chunk:
+                y = y[:, :, ft - 1:, :, :]
+            if fs > 1:
+                T_out = y.shape[2]
+                y = F.interpolate(y.reshape(B, C_out * T_out, H, W), scale_factor=float(fs), mode="nearest-exact")
+                y = y.reshape(B, C_out, T_out, H * fs, W * fs)
+            return y
+
+        if ft == 1 and repeats % fs == 0:
+            r_h = repeats // fs
+            y = x if r_h == 1 else x.repeat_interleave(r_h, dim=1)
+            if T == 1:
+                y = y.reshape(B, C_out, fs, H, W).permute(0, 1, 3, 2, 4).reshape(B, C_out, H * fs, W)
+                y = F.interpolate(y, scale_factor=(1.0, float(fs)), mode="nearest-exact")
+                return y.unsqueeze(2)
+            y = y.reshape(B, C_out, fs, T, H, W).permute(0, 1, 3, 4, 2, 5).reshape(B, C_out * T, H * fs, W)
+            y = F.interpolate(y, scale_factor=(1.0, float(fs)), mode="nearest-exact")
+            return y.reshape(B, C_out, T, H * fs, W * fs)
+
         x = x.repeat_interleave(self.repeats, dim=1)
         x = x.view(
             x.size(0),
@@ -415,6 +616,21 @@ class Up_ResidualBlock(nn.Module):
             x_main = module(x_main, feat_cache, feat_idx)
         if self.avg_shortcut is not None:
             if feat_cache is None:
+                if (
+                    first_chunk
+                    and x.shape[2] == 1
+                    and x_main.shape[2] == 1
+                    and x_main.dtype == torch.bfloat16
+                    and _hpu_tpc_ready(x)
+                    and not self.training
+                    and not self.avg_shortcut.training
+                    and not _has_hooks(self.avg_shortcut)
+                ):
+                    mode = self.avg_shortcut._hpu_dupup2d_mode()
+                    if mode >= 0:
+                        return _hpu_tpc.vae_dupup2d_add_bf16(
+                            x.squeeze(2), x_main.squeeze(2), self.avg_shortcut.out_channels, mode, 1
+                        ).unsqueeze(2)
                 return strip_apply(lambda s: self.avg_shortcut(s, first_chunk), x, scale=self.avg_shortcut.factor_s, halo=0, out=x_main)
             x_shortcut = self.avg_shortcut(x, first_chunk)
             return x_main + x_shortcut
@@ -519,6 +735,26 @@ class Encoder3d(nn.Module):
                 x = layer(x)
 
         ## head
+        if (
+            feat_cache is None
+            and x.shape[2] == 1
+            and _hpu_tpc_ready(x)
+            and not self.training
+            and not _has_hooks(self.head)
+            and len(self.head) == 3
+            and _is_eligible_rms_silu_pair(self.head[0], self.head[1])
+        ):
+            xc = x if x.is_contiguous() else x.contiguous()
+            b_sz, c_in, _, h_full, w_full = xc.shape
+            h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                xc.view(b_sz, c_in, h_full * w_full),
+                _hpu_gamma_1d(self.head[0], xc.device),
+                0,
+                h_full * w_full,
+                1,
+                float(self.head[0].scale),
+            )
+            return self.head[2](h.view(b_sz, c_in, 1, h_full, w_full))
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
@@ -632,6 +868,26 @@ class Decoder3d(nn.Module):
                 x = layer(x, first_chunk=first_chunk)
 
         ## head
+        if (
+            feat_cache is None
+            and x.shape[2] == 1
+            and _hpu_tpc_ready(x)
+            and not self.training
+            and not _has_hooks(self.head)
+            and len(self.head) == 3
+            and _is_eligible_rms_silu_pair(self.head[0], self.head[1])
+        ):
+            xc = x if x.is_contiguous() else x.contiguous()
+            b_sz, c_in, _, h_full, w_full = xc.shape
+            h = _hpu_tpc.vae_rmsnorm_silu_bf16(
+                xc.view(b_sz, c_in, h_full * w_full),
+                _hpu_gamma_1d(self.head[0], xc.device),
+                0,
+                h_full * w_full,
+                1,
+                float(self.head[0].scale),
+            )
+            return self.head[2](h.view(b_sz, c_in, 1, h_full, w_full))
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]

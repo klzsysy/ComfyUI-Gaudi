@@ -369,6 +369,45 @@ static std::tuple<at::Tensor, at::Tensor> exec_moss_expmax_fp8(
     return {r[0], r[1]};
 }
 
+static habana::PartialOutputMetaDataVector meta_vae_rmsnorm_silu(const at::Stack& s) {
+    auto x = s.at(0).toTensor();
+    int64_t n_len = s.at(3).toInt();
+    return {{at::kBFloat16, {x.size(0), x.size(1), n_len}}};
+}
+static std::shared_ptr<void> fill_vae_rmsnorm_silu(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(VaeRmsNormSiluParams);
+    params->n_offset = static_cast<int32_t>(s.at(2).toInt());
+    params->n_len = static_cast<int32_t>(s.at(3).toInt());
+    params->do_silu = static_cast<int32_t>(s.at(4).toInt());
+    params->scale = static_cast<float>(s.at(5).toDouble());
+    return params;
+}
+static at::Tensor exec_vae_rmsnorm_silu(
+    const at::Tensor& x, const at::Tensor& gamma,
+    int64_t n_offset, int64_t n_len, int64_t do_silu, double scale) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_vae_rmsnorm_silu_bf16");
+    return op.execute({x, gamma, n_offset, n_len, do_silu, scale})[0];
+}
+
+static habana::PartialOutputMetaDataVector meta_vae_dupup2d_add(const at::Stack& s) {
+    auto x = s.at(0).toTensor();
+    int64_t c_out = s.at(2).toInt();
+    return {{at::kBFloat16, {x.size(0), c_out, x.size(2) * 2, x.size(3) * 2}}};
+}
+static std::shared_ptr<void> fill_vae_dupup2d_add(const at::Stack& s, size_t& size) {
+    HPU_PARAMS_STUB(VaeDupUp2dAddParams);
+    params->c_out = static_cast<int32_t>(s.at(2).toInt());
+    params->mode = static_cast<int32_t>(s.at(3).toInt());
+    params->has_main = static_cast<int32_t>(s.at(4).toInt());
+    return params;
+}
+static at::Tensor exec_vae_dupup2d_add(
+    const at::Tensor& x, const at::Tensor& main_t,
+    int64_t c_out, int64_t mode, int64_t has_main) {
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::comfy_vae_dupup2d_add_bf16");
+    return op.execute({x, main_t, c_out, mode, has_main})[0];
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
     lib.def("comfy_qwen35_topk_s1(Tensor logits, Tensor pen_mask, Tensor anc_toks, int has_pen, float pres_pen, float rep_pen) -> Tensor");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_qwen35_topk_s1", "comfy_topk_s1_bmax", meta_topk_s1, fill_topk_s1);
@@ -426,6 +465,12 @@ TORCH_LIBRARY_FRAGMENT(custom_op, lib) {
 
     lib.def("comfy_moss_expmax_fp8(Tensor scores, int valid_keys) -> (Tensor, Tensor)");
     habana::custom_op::registerUserCustomOp("custom_op::comfy_moss_expmax_fp8", "comfy_moss_expmax_fp8", meta_moss_expmax_fp8, fill_moss_expmax_fp8);
+
+    lib.def("comfy_vae_rmsnorm_silu_bf16(Tensor x, Tensor gamma, int n_offset, int n_len, int do_silu, float scale) -> Tensor");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_vae_rmsnorm_silu_bf16", "comfy_vae_rmsnorm_silu_bf16", meta_vae_rmsnorm_silu, fill_vae_rmsnorm_silu);
+
+    lib.def("comfy_vae_dupup2d_add_bf16(Tensor x, Tensor main_t, int c_out, int mode, int has_main) -> Tensor");
+    habana::custom_op::registerUserCustomOp("custom_op::comfy_vae_dupup2d_add_bf16", "comfy_vae_dupup2d_add_bf16", meta_vae_dupup2d_add, fill_vae_dupup2d_add);
 }
 
 TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
@@ -448,4 +493,6 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, lib) {
     lib.impl("comfy_moss_hnd_scale_quant", exec_moss_hnd_scale_q);
     lib.impl("comfy_moss_hnd_scale_sum_quant", exec_moss_hnd_scale_sum_q);
     lib.impl("comfy_moss_expmax_fp8", exec_moss_expmax_fp8);
+    lib.impl("comfy_vae_rmsnorm_silu_bf16", exec_vae_rmsnorm_silu);
+    lib.impl("comfy_vae_dupup2d_add_bf16", exec_vae_dupup2d_add);
 }

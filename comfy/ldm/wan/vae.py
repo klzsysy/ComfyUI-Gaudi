@@ -10,6 +10,11 @@ from comfy.ldm.modules.diffusionmodules.model import vae_attention, torch_cat_if
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
+try:
+    from comfy.text_encoders import hpu_qwen35_tpc as _hpu_tpc
+except Exception:
+    _hpu_tpc = None
+
 CACHE_T = 2
 
 
@@ -60,6 +65,25 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else None
 
     def forward(self, x):
+        if (
+            _hpu_tpc is not None
+            and _hpu_tpc.available
+            and self.channel_first
+            and self.bias is None
+            and not self.training
+            and not torch.is_grad_enabled()
+            and x.device.type == "hpu"
+            and x.dtype == torch.bfloat16
+            and (x.ndim == 4 or (x.ndim == 5 and x.shape[2] == 1))
+        ):
+            xc = x if x.is_contiguous() else x.contiguous()
+            b, c = xc.shape[0], xc.shape[1]
+            n_len = xc.numel() // (b * c)
+            g = self.gamma.view(-1)
+            if g.device != xc.device or g.dtype != torch.bfloat16:
+                g = g.to(device=xc.device, dtype=torch.bfloat16)
+            y = _hpu_tpc.vae_rmsnorm_silu_bf16(xc.view(b, c, n_len), g, 0, n_len, 0, float(self.scale))
+            return y.view(xc.shape)
         return F.normalize(
             x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma.to(x) + (self.bias.to(x) if self.bias is not None else 0)
 

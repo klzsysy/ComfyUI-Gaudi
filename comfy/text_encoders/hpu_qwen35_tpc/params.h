@@ -77,3 +77,16 @@ struct MossResAdalnParams {
 struct MossExpMaxParams {
     int32_t valid_keys;
 };
+
+struct VaeRmsNormSiluParams {
+    int32_t n_offset;
+    int32_t n_len;
+    int32_t do_silu;
+    float scale;
+};
+
+struct VaeDupUp2dAddParams {
+    int32_t c_out;
+    int32_t mode;
+    int32_t has_main;
+};

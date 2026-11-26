@@ -25,6 +25,8 @@ extern "C" const unsigned char moss_hnd_scale_q_start[], moss_hnd_scale_q_end[];
 extern "C" const unsigned char moss_hnd_scale_sum_q_start[], moss_hnd_scale_sum_q_end[];
 extern "C" const unsigned char moss_expmax_fp8_start[], moss_expmax_fp8_end[];
 extern "C" const unsigned char qwen_expmax_bf16_start[], qwen_expmax_bf16_end[];
+extern "C" const unsigned char vae_rmsnorm_silu_bf16_start[], vae_rmsnorm_silu_bf16_end[];
+extern "C" const unsigned char vae_dupup2d_add_bf16_start[], vae_dupup2d_add_bf16_end[];
 
 static const char* const kGuids[] = {
     "comfy_topk_s1_bmax",
@@ -47,6 +49,8 @@ static const char* const kGuids[] = {
     "comfy_moss_hnd_scale_sum_quant_fp8",
     "comfy_moss_expmax_fp8",
     "comfy_qwen_expmax_bf16",
+    "comfy_vae_rmsnorm_silu_bf16",
+    "comfy_vae_dupup2d_add_bf16",
 };
 static constexpr uint32_t kNumGuids = sizeof(kGuids) / sizeof(kGuids[0]);
 
@@ -326,6 +330,27 @@ extern "C" GlueCodeReturn GetShapeInference(DeviceId device, const ShapeInferenc
             ox.dims = 1; ox.dataType = DATA_F32;
             ox.maxSizes[0] = ox.minSizes[0] = sg.maxSizes[1];
         }
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_vae_rmsnorm_silu_bf16")) {
+        const auto* prm = static_cast<const VaeRmsNormSiluParams*>(p->nodeParams.nodeParams);
+        const auto& xg = p->inputTensors[0]->geometry;
+        auto& o0 = out->outputTensors[0]->geometry;
+        o0 = xg;
+        o0.dataType = DATA_BF16;
+        o0.maxSizes[0] = o0.minSizes[0] = static_cast<uint64_t>(prm->n_len);
+        return GLUE_SUCCESS;
+    }
+    if (!std::strcmp(name, "comfy_vae_dupup2d_add_bf16")) {
+        const auto* prm = static_cast<const VaeDupUp2dAddParams*>(p->nodeParams.nodeParams);
+        const auto& xg = p->inputTensors[0]->geometry;
+        auto& o0 = out->outputTensors[0]->geometry;
+        o0 = xg;
+        o0.dataType = DATA_BF16;
+        o0.maxSizes[0] = o0.minSizes[0] = xg.maxSizes[0] * 2;
+        o0.maxSizes[1] = o0.minSizes[1] = xg.maxSizes[1] * 2;
+        o0.maxSizes[2] = o0.minSizes[2] = static_cast<uint64_t>(prm->c_out);
+        o0.maxSizes[3] = o0.minSizes[3] = xg.maxSizes[3];
         return GLUE_SUCCESS;
     }
     return GLUE_NODE_NOT_FOUND;
@@ -822,6 +847,64 @@ extern "C" GlueCodeReturn InstantiateTpcKernel(HabanaKernelParams* p, HabanaKern
         std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
         out->kernel.paramsNr = 3;
         return copy_elf(out, qwen_expmax_bf16_start, qwen_expmax_bf16_end);
+    }
+    if (!std::strcmp(name, "comfy_vae_rmsnorm_silu_bf16")) {
+        if (p->inputTensorNr != 2 || p->outputTensorNr != 1) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const VaeRmsNormSiluParams*>(p->nodeParams.nodeParams);
+        const auto& xg = p->inputTensors[0].geometry;
+        const auto& gg = p->inputTensors[1].geometry;
+        if (!prm || xg.dims != 3 || xg.dataType != DATA_BF16 || gg.dims != 1 || gg.dataType != DATA_BF16)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t N_full = xg.maxSizes[0];
+        uint64_t C = xg.maxSizes[1];
+        uint64_t B = xg.maxSizes[2];
+        if (C == 0 || B == 0 || gg.maxSizes[0] != C || prm->n_offset < 0 || prm->n_len <= 0
+            || static_cast<uint64_t>(prm->n_offset) + static_cast<uint64_t>(prm->n_len) > N_full)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t n_blocks = (static_cast<uint64_t>(prm->n_len) + 255) / 256;
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = B * n_blocks;
+        out->preferredSplitDim = 0;
+        set_all_required(out, 2, 1);
+        uint32_t sp[] = {
+            uint32_t(C), uint32_t(B), uint32_t(prm->n_offset), uint32_t(prm->n_len),
+            uint32_t(n_blocks), uint32_t(prm->do_silu), f2u(prm->scale),
+        };
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 7;
+        return copy_elf(out, vae_rmsnorm_silu_bf16_start, vae_rmsnorm_silu_bf16_end);
+    }
+    if (!std::strcmp(name, "comfy_vae_dupup2d_add_bf16")) {
+        if (p->inputTensorNr != 2 || p->outputTensorNr != 1) return GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
+        const auto* prm = static_cast<const VaeDupUp2dAddParams*>(p->nodeParams.nodeParams);
+        const auto& xg = p->inputTensors[0].geometry;
+        const auto& mg = p->inputTensors[1].geometry;
+        if (!prm || xg.dims != 4 || xg.dataType != DATA_BF16 || mg.dims != 4 || mg.dataType != DATA_BF16)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t W = xg.maxSizes[0];
+        uint64_t H = xg.maxSizes[1];
+        uint64_t C_in = xg.maxSizes[2];
+        uint64_t B = xg.maxSizes[3];
+        if (W == 0 || H == 0 || B == 0 || prm->c_out <= 0 || prm->mode < 0 || prm->mode > 3)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        uint64_t C_out = static_cast<uint64_t>(prm->c_out);
+        uint64_t expected_cin = (prm->mode == 0) ? C_out : ((prm->mode == 3) ? (C_out * 4) : (C_out * 2));
+        if (C_in != expected_cin) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (prm->has_main) {
+            if (mg.maxSizes[0] != W * 2 || mg.maxSizes[1] != H * 2 || mg.maxSizes[2] != C_out || mg.maxSizes[3] != B)
+                return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        }
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = B * C_out * H;
+        out->preferredSplitDim = 0;
+        set_all_required(out, 2, 1);
+        uint32_t sp[] = {
+            uint32_t(W), uint32_t(H), uint32_t(C_out), uint32_t(B),
+            uint32_t(prm->mode), uint32_t(prm->has_main),
+        };
+        std::memcpy(out->kernel.scalarParams, sp, sizeof(sp));
+        out->kernel.paramsNr = 6;
+        return copy_elf(out, vae_dupup2d_add_bf16_start, vae_dupup2d_add_bf16_end);
     }
     return GLUE_NODE_NOT_FOUND;
 }

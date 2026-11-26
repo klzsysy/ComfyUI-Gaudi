@@ -223,6 +223,14 @@ if available:
             scores.new_empty((scores.shape[0],), dtype=torch.float32),
         )
 
+    @torch.library.register_fake("custom_op::comfy_vae_rmsnorm_silu_bf16")
+    def _fake_vae_rmsnorm_silu_bf16(x, gamma, n_offset, n_len, do_silu, scale):
+        return x.new_empty((x.shape[0], x.shape[1], n_len), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("custom_op::comfy_vae_dupup2d_add_bf16")
+    def _fake_vae_dupup2d_add_bf16(x, main_t, c_out, mode, has_main):
+        return x.new_empty((x.shape[0], c_out, x.shape[2] * 2, x.shape[3] * 2), dtype=torch.bfloat16)
+
 
 def topk(logits, pen_mask, anc_toks, k, has_pen, pres_pen, rep_pen):
     bmax = torch.ops.custom_op.comfy_qwen35_topk_s1(logits, pen_mask, anc_toks, has_pen, pres_pen, rep_pen)
@@ -302,3 +310,18 @@ def moss_hnd_scale_sum_quant(attn, scales, sum_in):
 
 def moss_expmax_fp8(scores, valid_keys):
     return torch.ops.custom_op.comfy_moss_expmax_fp8(scores, valid_keys)
+
+
+def vae_rmsnorm_silu_bf16(x, gamma, n_offset, n_len, do_silu, scale):
+    return torch.ops.custom_op.comfy_vae_rmsnorm_silu_bf16(x, gamma, n_offset, n_len, do_silu, scale)
+
+
+def vae_dupup2d_add_bf16(x, main_t, c_out, mode, has_main):
+    b, c_in, h, w = x.shape
+    # Viewing through 3D strips HPU internal 4D Conv2d layout metadata (zero-copy when already NCHW).
+    x4 = x.reshape(b, c_in, h * w).view(b, c_in, h, w)
+    if has_main:
+        m4 = main_t.reshape(b, c_out, (h * 2) * (w * 2)).view(b, c_out, h * 2, w * 2)
+    else:
+        m4 = main_t
+    return torch.ops.custom_op.comfy_vae_dupup2d_add_bf16(x4, m4, c_out, mode, has_main)
